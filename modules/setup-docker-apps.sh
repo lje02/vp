@@ -3,7 +3,7 @@
 #  Docker + Docker Compose 安装 & 热门应用一键部署脚本
 #  支持：WordPress / Nextcloud / Gitea / Uptime Kuma /
 #        Portainer / phpMyAdmin / Redis Commander / MinIO /
-#        Lsky Pro / EasyImage / AList
+#        Lsky Pro / EasyImage / OpenList
 #  支持多实例：通过 --deploy APP --instance NAME 或交互菜单指定
 #  用法：sudo bash setup-docker-apps.sh [选项]
 # ----------------------------------------------------------
@@ -103,7 +103,7 @@ ensure_ssh_key() {
 
 ALL_APPS=(
     wordpress nextcloud gitea uptime-kuma portainer
-    phpmyadmin redis-commander minio lskypro easyimage alist
+    phpmyadmin redis-commander minio lskypro easyimage openlist
     sunpanel vaultwarden emby
 )
 
@@ -118,7 +118,7 @@ declare -A APP_DESC=(
     [minio]="MinIO              S3 兼容对象存储"
     [lskypro]="Lsky Pro           兰空图床（含 MariaDB）"
     [easyimage]="EasyImage          轻量图床"
-    [alist]="AList              多存储文件列表/网盘挂载"
+    [openlist]="OpenList           多存储文件列表/网盘挂载"
     [sunpanel]="Sun-Panel          个人豪华版导航页"
     [vaultwarden]="Vaultwarden        轻量级密码管理器"
     [emby]="Emby Server       多媒体服务器（视频海报墙）"
@@ -127,7 +127,7 @@ declare -A APP_DESC=(
 declare -A APP_DEFAULT_PORT=(
     [wordpress]=8080 [nextcloud]=8081 [gitea]=3000 [uptime-kuma]=3001
     [portainer]=9000 [phpmyadmin]=8082 [redis-commander]=8083
-    [minio]=9001 [lskypro]=8085 [easyimage]=8086 [alist]=5244
+    [minio]=9001 [lskypro]=8085 [easyimage]=8086 [openlist]=5244
     [sunpanel]=3002 [vaultwarden]=8099 [emby]=8096
 )
 
@@ -866,10 +866,10 @@ usage() {
 
 示例:
   sudo bash $0
-  sudo bash $0 --backup /opt/docker-apps/alist
+  sudo bash $0 --backup /opt/docker-apps/openlist
   sudo bash $0 --backup /opt/docker-apps/wordpress \\
        --remote root@10.0.0.2 --remote-path /data/backups
-  sudo bash $0 --restore /var/backups/docker-apps/alist_20250606_120000.tar.gz
+  sudo bash $0 --restore /var/backups/docker-apps/openlist_20250606_120000.tar.gz
   sudo bash $0 --restore --remote root@10.0.0.2 \\
        /var/backups/docker-apps/wordpress_20250606.tar.gz
 EOF
@@ -1785,12 +1785,12 @@ YAML
     log "EasyImage 已启动 → http://127.0.0.1:${HOST_PORT}"
 }
 
-deploy_alist() {
-    local DIR="${1:-$BASE_DIR/alist}"
-    local HOST_PORT="${2:-${APP_DEFAULT_PORT[alist]}}"
+deploy_openlist() {
+    local DIR="${1:-$BASE_DIR/openlist}"
+    local HOST_PORT="${2:-${APP_DEFAULT_PORT[openlist]}}"
     local NET
     NET=$(net_name "$DIR")
-    header "开始部署 AList"
+    header "开始部署 OpenList"
 
     # ── [FIX #9] 提前确保目录存在并可进入 ────────────────────────────
     mkdir -p "$DIR" || { error "无法创建目录: $DIR"; return 1; }
@@ -1842,17 +1842,17 @@ deploy_alist() {
 
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
-  alist:
-    # 原作者 xhofe 的账号已于 2025 年易主，官方文档已改为推荐 alist666/alist，
-    # 不再建议使用 xhofe/alist（来源不再可信）
-    image: alist666/alist:latest
+  openlist:
+    # AList 原作者 xhofe 的账号已于 2025 年易主，alist666/alist 目前 latest 标签
+    # 实际只发布了 linux/arm64 镜像，在 amd64 主机上会触发平台不匹配警告
+    # 并退化为 QEMU 模拟运行。改用社区可信分支 OpenList（多架构原生支持）。
+    image: openlistteam/openlist:latest
     restart: unless-stopped
+    user: "${puid}:${pgid}"
     environment:
-      - PUID=${puid}
-      - PGID=${pgid}
       - UMASK=022
     volumes:
-      - ./data:/opt/alist/data
+      - ./data:/opt/openlist/data
 ${MEDIA_MOUNT}
     ports:
       - target: 5244
@@ -1876,22 +1876,22 @@ YAML
 
     # ── [FIX #3] 检查容器运行状态而非仅检查 ID ───────────────────────
     local cid=""
-    cid=$(docker compose ps -q alist 2>/dev/null || true)
+    cid=$(docker compose ps -q openlist 2>/dev/null || true)
 
     if [[ -z "$cid" ]]; then
-        error "AList 容器启动失败，请使用 'docker compose logs' 检查错误原因。"
+        error "OpenList 容器启动失败，请使用 'docker compose logs' 检查错误原因。"
         return 1
     fi
 
     local container_state
     container_state=$(docker inspect --format='{{.State.Status}}' "$cid" 2>/dev/null || true)
     if [[ "$container_state" != "running" ]]; then
-        error "AList 容器未处于运行状态（当前状态: ${container_state:-未知}），请执行 'docker compose logs' 排查。"
+        error "OpenList 容器未处于运行状态（当前状态: ${container_state:-未知}），请执行 'docker compose logs' 排查。"
         return 1
     fi
 
     # ── [FIX #4] 用健康检查轮询替代 sleep 5 ─────────────────────────
-    info "等待 AList 服务就绪（最长等待 60 秒）..."
+    info "等待 OpenList 服务就绪（最长等待 60 秒）..."
     local retries=12
     local health_status=""
     while [[ $retries -gt 0 ]]; do
@@ -1916,26 +1916,26 @@ YAML
     # [FIX #5/6] 方案 B：使用绝对路径，避免依赖容器工作目录
     if [[ -z "$init_pw" ]]; then
         info "日志中未检索到密码，尝试进入容器主动获取..."
-        init_pw=$(docker exec -i "$cid" /opt/alist/alist admin 2>/dev/null \
+        init_pw=$(docker exec -i "$cid" /opt/openlist/openlist admin 2>/dev/null \
             | grep -oE 'password: [^ ]+' \
             | awk '{print $2}' \
             | tail -1 || true)
     fi
 
-    log "AList 服务已成功拉起 → http://127.0.0.1:${HOST_PORT}"
+    log "OpenList 服务已成功拉起 → http://127.0.0.1:${HOST_PORT}"
 
     if [[ -n "${init_pw:-}" ]]; then
         # 剥离 ANSI 控制字符，确保写入 .env 的是纯文本
         init_pw=$(printf '%s' "$init_pw" | sed -r "s/\x1B\[([0-9]{1,3}(;[0-9]{1,2})?)?[mGK]//g")
         log "初始管理员密码: ${init_pw}"
-        echo "ALIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
+        echo "OPENLIST_INIT_PASSWORD=${init_pw}" >> "$DIR/.env"
         log "凭据已安全备份至 $DIR/.env"
     else
         warn "未能自动捕获到初始密码（可能由于非首次部署或存储卷已有数据）。"
         warn "如需手动重置密码，请执行以下命令："
         # [FIX #10] 改用服务名，避免 cid 为空时提示无效
-        warn "  随机新密码: docker compose exec alist /opt/alist/alist admin random"
-        warn "  指定新密码: docker compose exec alist /opt/alist/alist admin set <你的新密码>"
+        warn "  随机新密码: docker compose exec openlist /opt/openlist/openlist admin random"
+        warn "  指定新密码: docker compose exec openlist /opt/openlist/openlist admin set <你的新密码>"
     fi
 }
 
