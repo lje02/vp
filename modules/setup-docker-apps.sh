@@ -1914,17 +1914,21 @@ YAML
     local init_pw=""
 
     # [FIX #5] 方案 A：统一使用 grep -oE + awk，兼容 BusyBox
+    # OpenList 实际日志格式为 "...the initial password is: xxxx"，
+    # 而非旧版 alist 的 "password: xxxx"，这里用 -F: 取冒号后最后一段来兼容两种格式
     init_pw=$(docker logs "$cid" 2>&1 \
-        | grep -oE 'password: [^ ]+' \
-        | awk '{print $2}' \
+        | grep -oiE 'password[^:]*:[[:space:]]*[^[:space:]]+' \
+        | awk -F: '{print $NF}' \
+        | tr -d '[:space:]' \
         | tail -1 || true)
 
     # [FIX #5/6] 方案 B：使用绝对路径，避免依赖容器工作目录
     if [[ -z "$init_pw" ]]; then
         info "日志中未检索到密码，尝试进入容器主动获取..."
         init_pw=$(docker exec -i "$cid" /opt/openlist/openlist admin 2>/dev/null \
-            | grep -oE 'password: [^ ]+' \
-            | awk '{print $2}' \
+            | grep -oiE 'password[^:]*:[[:space:]]*[^[:space:]]+' \
+            | awk -F: '{print $NF}' \
+            | tr -d '[:space:]' \
             | tail -1 || true)
     fi
 
