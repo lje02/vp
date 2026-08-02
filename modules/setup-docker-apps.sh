@@ -1800,6 +1800,12 @@ deploy_openlist() {
     puid=$(( ${PUID:-1000} + 0 ))
     pgid=$(( ${PGID:-1000} + 0 ))
 
+    # ── [FIX #11] 提前创建 data 目录并赋权，避免 Docker 自动创建时属主为
+    #    root，导致容器内非 root 用户（${puid}:${pgid}）无写权限而初始化失败 ──
+    mkdir -p "$DIR/data" || { error "无法创建目录: $DIR/data"; return 1; }
+    chown -R "${puid}:${pgid}" "$DIR/data" 2>/dev/null \
+        || warn "无法 chown $DIR/data 到 ${puid}:${pgid}（可能不是 root 执行），如容器启动失败请手动执行 sudo chown -R ${puid}:${pgid} \"$DIR/data\""
+
     # ── 媒体库映射逻辑 ──────────────────────────────────────────────
     local MEDIA_MOUNT=""
     echo -ne "${YELLOW}[?] 是否需要映射宿主机本地媒体库/存储目录到容器？(y/n): ${NC}"
