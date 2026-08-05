@@ -137,6 +137,19 @@ validate_safe_path() {
     done
 }
 
+# 校验域名 / server_name 输入，防止把非法字符写进 nginx 配置（server_name 注入）
+# 或未转义地写进静态占位页 HTML（自我 XSS）。
+# 支持空格分隔的多个 server_name，以及 *. 通配符前缀。
+validate_domain() {
+    local input="$1" tok
+    local label='[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    for tok in $input; do
+        if [[ ! "$tok" =~ ^(\*\.)?${label}(\.${label})*$ ]]; then
+            die "域名格式非法: \"${tok}\"（仅允许字母、数字、连字符、点，可用 *. 通配符前缀）"
+        fi
+    done
+}
+
 # FIX: normalize_url 增加空字符串守卫
 normalize_url() {
     local url="${1%/}"
@@ -557,6 +570,7 @@ security_headers_lines() {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    add_header Content-Security-Policy "object-src 'none'; base-uri 'self'; frame-ancestors 'self'; upgrade-insecure-requests" always;
 EOF
 }
 
@@ -1177,6 +1191,7 @@ site_create_static() {
 
     safe_read -rp "域名或 server_name: " domain
     [[ -z "$domain" ]] && die "域名不能为空"
+    validate_domain "$domain"
 
     safe_read -rp "网站根目录（绝对路径）[默认 ${WEBROOT_BASE}/${domain}/public]: " web_dir
     [[ -z "$web_dir" ]] && web_dir="${WEBROOT_BASE}/${domain}/public"
@@ -1273,6 +1288,7 @@ site_create_proxy() {
     local domain="" backend=""
     safe_read -rp "域名或 server_name: " domain
     [[ -z "$domain" ]] && die "域名不能为空"
+    validate_domain "$domain"
     safe_read -rp "后端目标地址（如 127.0.0.1:3000 或 http://10.0.0.5:8080）: " backend
     [[ -z "$backend" ]] && die "后端地址不能为空"
     backend=$(normalize_url "$backend")
@@ -1363,6 +1379,7 @@ site_create_mirror() {
 
     safe_read -rp "域名或 server_name: " domain
     [[ -z "$domain" ]] && die "域名不能为空"
+    validate_domain "$domain"
 
     safe_read -rp "外部目标 URL（如 https://api.example.com）: " target_url
     [[ -z "$target_url" ]] && die "目标 URL 不能为空"
@@ -1759,6 +1776,7 @@ site_create_loadbalance() {
     local domain=""
     safe_read -rp "域名或 server_name: " domain
     [[ -z "$domain" ]] && die "域名不能为空"
+    validate_domain "$domain"
 
     echo ""
     echo -e "${CYAN}── 负载均衡算法 ──${NC}"
