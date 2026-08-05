@@ -258,6 +258,11 @@ cmd_uninstall() {
     local default_iface
     default_iface=$(ip route show default | awk '/default/{print $5}' | head -1 || echo "")
 
+    if _ufw_active; then
+        _ufw_teardown_forwarding "$default_iface"
+    fi
+
+    # 兼容非 UFW 模式下手动加的裸 iptables 规则，尽力清理，失败可忽略
     iptables -D INPUT   -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -o "${WG_IFACE}" -j ACCEPT 2>/dev/null || true
@@ -328,6 +333,107 @@ cmd_genkey() {
     info "公钥: $(cat "$PUB_KEY_FILE")"
 }
 
+
+# ═══════════════════════════════════════════════════════════
+# UFW 集成（若检测到 UFW 处于 active 状态，优先用 UFW 原生方式
+# 管理端口放行/转发/NAT，避免 ufw reload 冲掉裸 iptables 规则）
+# ═══════════════════════════════════════════════════════════
+
+_ufw_active() {
+    command -v ufw &>/dev/null || return 1
+    ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+# 从 "10.10.0.1/24,fd00::1/64" 这种逗号分隔地址串里，取出指定协议族的一段
+# 用法: _extract_cidr_family "$WG_ADDR" 4|6
+_extract_cidr_family() {
+    local addr_list="$1" family="$2" entry
+    local -a parts
+    IFS=',' read -ra parts <<< "$addr_list"
+    for entry in "${parts[@]}"; do
+        if [[ "$family" == "6" && "$entry" == *:* ]]; then
+            printf '%s' "$entry"; return 0
+        elif [[ "$family" == "4" && "$entry" != *:* ]]; then
+            printf '%s' "$entry"; return 0
+        fi
+    done
+    return 1
+}
+
+# 幂等地把 NAT/MASQUERADE 块插入 ufw 的 before.rules / before6.rules 头部
+# （iptables -s A.B.C.D/MASK 会自动按掩码匹配整个网段，无需手动清零主机位）
+_ufw_add_nat_block() {
+    local rules_file="$1" wg_source="$2" out_iface="$3" marker="$4"
+    [[ -f "$rules_file" ]] || return 1
+    grep -qF "$marker" "$rules_file" 2>/dev/null && return 0
+
+    local tmp
+    tmp=$(mktemp)
+    {
+        printf '# BEGIN %s（wireguard-mesh.sh 自动生成，勿手动编辑本段）\n' "$marker"
+        printf '*nat\n:POSTROUTING ACCEPT [0:0]\n'
+        printf -- '-A POSTROUTING -s %s -o %s -j MASQUERADE\n' "$wg_source" "$out_iface"
+        printf 'COMMIT\n'
+        printf '# END %s\n' "$marker"
+        cat "$rules_file"
+    } > "$tmp"
+    mv "$tmp" "$rules_file"
+    chmod 640 "$rules_file"
+}
+
+_ufw_remove_nat_block() {
+    local rules_file="$1" marker="$2"
+    [[ -f "$rules_file" ]] || return 0
+    grep -qF "$marker" "$rules_file" 2>/dev/null || return 0
+    sed -i "/# BEGIN ${marker}/,/# END ${marker}/d" "$rules_file"
+}
+
+# 初始化时调用：用 UFW 原生命令放行端口 + 转发 + NAT，替代裸 iptables PostUp/PostDown
+_ufw_setup_forwarding() {
+    local default_iface="$1" wg_addr="$2"
+    header "检测到 UFW（active），改用 UFW 原生方式管理防火墙规则"
+
+    ufw allow "${WG_PORT}/udp" comment "WireGuard ${WG_IFACE}" >/dev/null
+    ufw route allow in on "${WG_IFACE}" out on "${default_iface}" >/dev/null 2>&1 || true
+    ufw route allow in on "${default_iface}" out on "${WG_IFACE}" >/dev/null 2>&1 || true
+    ufw route allow in on "${WG_IFACE}" out on "${WG_IFACE}" >/dev/null 2>&1 || true
+
+    local v4_src v6_src
+    v4_src=$(_extract_cidr_family "$wg_addr" 4) || v4_src=""
+    v6_src=$(_extract_cidr_family "$wg_addr" 6) || v6_src=""
+
+    [[ -n "$v4_src" ]] && _ufw_add_nat_block /etc/ufw/before.rules  "$v4_src" "$default_iface" "WIREGUARD-MESH-NAT-${WG_IFACE}-v4"
+    if [[ -n "$v6_src" ]]; then
+        if [[ -f /etc/ufw/before6.rules ]]; then
+            _ufw_add_nat_block /etc/ufw/before6.rules "$v6_src" "$default_iface" "WIREGUARD-MESH-NAT-${WG_IFACE}-v6"
+            grep -q '^IPV6=yes' /etc/default/ufw 2>/dev/null || warn "UFW 未启用 IPv6 (/etc/default/ufw IPV6=yes)，IPv6 转发规则可能不生效"
+        else
+            warn "未找到 /etc/ufw/before6.rules，跳过 IPv6 NAT 规则"
+        fi
+    fi
+
+    ufw reload >/dev/null 2>&1 || warn "ufw reload 失败，请手动执行 ufw reload 使规则生效"
+    log "UFW 规则已配置：端口放行 / 路由转发 / NAT（ufw status verbose 可查看）"
+}
+
+# 卸载时调用：撤销上面加的 UFW 规则
+_ufw_teardown_forwarding() {
+    local default_iface="$1"
+    _ufw_active || return 0
+    header "清理 UFW 中的 WireGuard 规则"
+
+    ufw --force delete allow "${WG_PORT}/udp" >/dev/null 2>&1 || true
+    ufw --force delete route allow in on "${WG_IFACE}" out on "${default_iface}" >/dev/null 2>&1 || true
+    ufw --force delete route allow in on "${default_iface}" out on "${WG_IFACE}" >/dev/null 2>&1 || true
+    ufw --force delete route allow in on "${WG_IFACE}" out on "${WG_IFACE}" >/dev/null 2>&1 || true
+
+    _ufw_remove_nat_block /etc/ufw/before.rules  "WIREGUARD-MESH-NAT-${WG_IFACE}-v4"
+    _ufw_remove_nat_block /etc/ufw/before6.rules "WIREGUARD-MESH-NAT-${WG_IFACE}-v6"
+
+    ufw reload >/dev/null 2>&1 || true
+    log "UFW 规则已清理"
+}
+
 cmd_init() {
     require_key
     local RAW_IP="$1"
@@ -372,7 +478,21 @@ EOF
     tmp=$(mktemp "${WG_DIR}/.wg_conf.XXXXXX")
     chmod 600 "$tmp"
 
-    cat > "$tmp" <<EOF
+    if _ufw_active; then
+        # UFW 模式：端口放行/转发/NAT 都交给 UFW 原生规则管理（见下方 _ufw_setup_forwarding），
+        # PostUp/PostDown 不再直接操作 iptables，避免 ufw reload 时把裸规则冲掉
+        cat > "$tmp" <<EOF
+[Interface]
+Address = ${WG_ADDR}
+PrivateKey = $(cat "$PRIV_KEY_FILE")
+ListenPort = ${WG_PORT}
+# 防火墙规则由 UFW 管理，见 /etc/ufw/before.rules 与 ufw route 规则（本脚本自动生成）
+EOF
+        mv "$tmp" "$WG_CONF"
+        _ufw_setup_forwarding "$default_iface" "$WG_ADDR"
+        log "双栈配置已生成 (出站网卡: ${default_iface}，防火墙: UFW)"
+    else
+        cat > "$tmp" <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = $(cat "$PRIV_KEY_FILE")
@@ -398,9 +518,9 @@ PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -i %i -j ACCE
 PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
 PostDown = which ip6tables >/dev/null 2>&1 && ip6tables -t nat -D POSTROUTING -o ${default_iface} -j MASQUERADE 2>/dev/null || true
 EOF
-
-    mv "$tmp" "$WG_CONF"
-    log "双栈配置已生成 (出站网卡: ${default_iface})"
+        mv "$tmp" "$WG_CONF"
+        log "双栈配置已生成 (出站网卡: ${default_iface}，防火墙: iptables PostUp/PostDown)"
+    fi
 }
 
 cmd_add_peer() {
