@@ -13,6 +13,10 @@ readonly WG_KEY_DIR="${WG_DIR}/keys"
 readonly PRIV_KEY_FILE="${WG_KEY_DIR}/privatekey"
 readonly PUB_KEY_FILE="${WG_KEY_DIR}/publickey"
 readonly BACKUP_DIR="/root/wg-backups"
+readonly WG_TOOLS_REPO="https://git.zx2c4.com/wireguard-tools"
+readonly WG_TOOLS_REPO_MIRROR="https://github.com/WireGuard/wireguard-tools.git"
+readonly WG_BUILD_DIR="/usr/local/src/wireguard-tools-build"
+readonly WG_BUILD_LOG="/tmp/wg-build.log"
 
 # ── 颜色输出 ────────────────────────────────────────────────
 if [[ -t 1 ]] && command -v tput &>/dev/null && tput colors &>/dev/null; then
@@ -117,56 +121,128 @@ _safe_rewrite_conf() {
 # 核心功能函数
 # ═══════════════════════════════════════════════════════════
 
-cmd_install() {
-    header "安装 WireGuard"
-    if command -v wg &>/dev/null; then
-        log "WireGuard 已安装: $(wg --version 2>&1 | head -1)"
-        return 0
-    fi
 
+# ── 安装 iptables（防火墙规则依赖，与 wireguard-tools 版本无关，仍走包管理器）─
+_install_iptables_pkg() {
     if command -v apt-get &>/dev/null; then
         apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools iptables
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
     elif command -v dnf &>/dev/null; then
-        dnf install -y wireguard-tools iptables
+        dnf install -y iptables
     elif command -v yum &>/dev/null; then
         yum install -y epel-release
-        yum install -y wireguard-tools iptables
+        yum install -y iptables
     elif command -v pacman &>/dev/null; then
-        pacman -Sy --noconfirm wireguard-tools iptables
+        pacman -Sy --noconfirm iptables
     else
-        error "不支持的包管理器，请手动安装 wireguard-tools 和 iptables"
+        warn "不支持的包管理器，请手动安装 iptables"
+        return 1
+    fi
+}
+
+# ── 安装编译依赖（gcc/make/git/pkg-config）────────────────────
+_install_build_deps() {
+    command -v gcc &>/dev/null && command -v make &>/dev/null && command -v git &>/dev/null && return 0
+
+    info "安装编译依赖 (gcc/make/git)..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential git pkg-config
+    elif command -v dnf &>/dev/null; then
+        dnf install -y gcc make git pkg-config
+    elif command -v yum &>/dev/null; then
+        yum groupinstall -y "Development Tools" 2>/dev/null || true
+        yum install -y gcc make git pkg-config
+    elif command -v pacman &>/dev/null; then
+        pacman -Sy --noconfirm base-devel git
+    else
+        warn "不支持的包管理器，请手动安装 gcc make git"
+        return 1
+    fi
+}
+
+# ── 从源码拉取最新 tag 并编译安装 wireguard-tools ──────────────
+# 成功返回 0；失败返回 1 且不改变已安装版本（构建目录/失败产物自动清理）
+_build_and_install_wg_tools() {
+    _install_build_deps || return 1
+
+    rm -rf "$WG_BUILD_DIR"
+    mkdir -p "$(dirname "$WG_BUILD_DIR")"
+
+    info "克隆 wireguard-tools 源码..."
+    if ! git clone --quiet "$WG_TOOLS_REPO" "$WG_BUILD_DIR" >"$WG_BUILD_LOG" 2>&1; then
+        warn "官方仓库克隆失败，尝试 GitHub 镜像..."
+        if ! git clone --quiet "$WG_TOOLS_REPO_MIRROR" "$WG_BUILD_DIR" >>"$WG_BUILD_LOG" 2>&1; then
+            warn "源码克隆失败（网络问题？），日志见 $WG_BUILD_LOG"
+            rm -rf "$WG_BUILD_DIR"
+            return 1
+        fi
     fi
 
-    modprobe wireguard 2>/dev/null || warn "wireguard 内核模块加载失败（非特权容器环境可忽略）"
-    log "WireGuard 安装完成: $(wg --version 2>&1 | head -1)"
+    local latest_tag
+    latest_tag=$(git -C "$WG_BUILD_DIR" tag -l 'v*' --sort=-v:refname | head -1)
+    if [[ -n "$latest_tag" ]]; then
+        git -C "$WG_BUILD_DIR" checkout --quiet "$latest_tag"
+        info "已切换到最新版本标签: $latest_tag"
+    else
+        warn "未找到版本标签，使用 master 最新提交编译"
+    fi
+
+    info "编译中（日志: $WG_BUILD_LOG）..."
+    if ! make -C "${WG_BUILD_DIR}/src" -j"$(nproc)" >"$WG_BUILD_LOG" 2>&1; then
+        warn "编译失败，日志见 $WG_BUILD_LOG"
+        rm -rf "$WG_BUILD_DIR"
+        return 1
+    fi
+
+    info "安装到 /usr ..."
+    if ! make -C "${WG_BUILD_DIR}/src" install PREFIX=/usr >>"$WG_BUILD_LOG" 2>&1; then
+        warn "安装失败，日志见 $WG_BUILD_LOG"
+        rm -rf "$WG_BUILD_DIR"
+        return 1
+    fi
+
+    rm -rf "$WG_BUILD_DIR"
+    return 0
+}
+
+cmd_install() {
+    header "安装 WireGuard"
+
+    _install_iptables_pkg || warn "iptables 安装失败，防火墙/NAT 规则可能无法生效"
+
+    if command -v wg &>/dev/null; then
+        info "检测到已安装: $(wg --version 2>&1 | head -1)，将编译安装最新版覆盖"
+    fi
+
+    if _build_and_install_wg_tools; then
+        modprobe wireguard 2>/dev/null || warn "wireguard 内核模块加载失败（内核 <5.6 需另装 DKMS 模块，或非特权容器环境可忽略）"
+        log "WireGuard 安装完成: $(wg --version 2>&1 | head -1)"
+    else
+        error "wireguard-tools 编译安装失败，请查看 $WG_BUILD_LOG"
+    fi
 }
 
 cmd_update() {
     header "更新 WireGuard"
     command -v wg &>/dev/null || { warn "WireGuard 未安装，请先执行安装"; return 1; }
 
+    info "当前版本: $(wg --version 2>&1 | head -1)"
+
     local was_up=false
     _iface_is_up && was_up=true && info "接口运行中，更新前将临时停止"
     $was_up && _stop_iface_safe || true
 
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y wireguard wireguard-tools
-    elif command -v dnf &>/dev/null; then
-        dnf upgrade -y wireguard-tools
-    elif command -v yum &>/dev/null; then
-        yum update -y wireguard-tools
-    elif command -v pacman &>/dev/null; then
-        pacman -Sy --noconfirm wireguard-tools
+    if _build_and_install_wg_tools; then
+        log "更新完成: $(wg --version 2>&1 | head -1)"
     else
-        error "不支持的包管理器"
+        warn "更新失败，已保留原版本: $(wg --version 2>&1 | head -1)"
     fi
 
-    log "更新完成: $(wg --version 2>&1 | head -1)"
+    # 无论编译是否成功都要恢复接口，避免更新失败导致断连且不自动恢复
     if $was_up; then
         info "正在重新启动接口..."
-        cmd_up
+        cmd_up || warn "接口重启失败，请手动执行「启动接口」"
     fi
 }
 
@@ -204,17 +280,23 @@ cmd_uninstall() {
     rmdir "$WG_KEY_DIR" 2>/dev/null || true
 
     local _pkg
-    read -r -t 30 -p "  同时卸载 wireguard-tools 软件包? [y/N] " _pkg || true
+    read -r -t 30 -p "  同时卸载 wireguard-tools 程序本体? [y/N] " _pkg || true
     if [[ "${_pkg,,}" == "y" ]]; then
+        # 本脚本通过源码编译安装（make install PREFIX=/usr），直接删除对应文件
+        rm -f /usr/bin/wg /usr/bin/wg-quick
+        rm -f /usr/share/man/man8/wg.8 /usr/share/man/man8/wg-quick.8
+        rm -f /usr/share/bash-completion/completions/wg /usr/share/bash-completion/completions/wg-quick
+        # 兼容此前可能通过包管理器安装的情形，尽力清理，失败可忽略
         if command -v apt-get &>/dev/null; then
-            apt-get remove -y wireguard wireguard-tools
+            apt-get remove -y wireguard wireguard-tools 2>/dev/null || true
         elif command -v dnf &>/dev/null; then
-            dnf remove -y wireguard-tools
+            dnf remove -y wireguard-tools 2>/dev/null || true
         elif command -v yum &>/dev/null; then
-            yum remove -y wireguard-tools
+            yum remove -y wireguard-tools 2>/dev/null || true
         elif command -v pacman &>/dev/null; then
-            pacman -R --noconfirm wireguard-tools
+            pacman -R --noconfirm wireguard-tools 2>/dev/null || true
         fi
+        log "wireguard-tools 程序本体已清理"
     fi
 
     log "卸载完成"
