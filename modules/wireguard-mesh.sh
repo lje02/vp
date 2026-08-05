@@ -523,6 +523,63 @@ EOF
     fi
 }
 
+# 把已存在的配置（保留所有 [Peer] 与密钥不动）从裸 iptables PostUp/PostDown
+# 迁移到 UFW 原生规则，不需要重新走一遍初始化、不会丢节点
+cmd_migrate_ufw() {
+    require_conf
+    header "迁移现有配置到 UFW 模式"
+
+    _ufw_active || { warn "未检测到 active 的 UFW，无需迁移"; return 1; }
+    grep -q '^# 防火墙规则由 UFW 管理' "$WG_CONF" 2>/dev/null && { warn "当前配置已经是 UFW 模式，无需迁移"; return 0; }
+
+    local wg_addr priv_key listen_port
+    wg_addr=$(grep -m1 '^Address'    "$WG_CONF" | sed 's/^Address[[:space:]]*=[[:space:]]*//')
+    priv_key=$(grep -m1 '^PrivateKey' "$WG_CONF" | sed 's/^PrivateKey[[:space:]]*=[[:space:]]*//')
+    listen_port=$(grep -m1 '^ListenPort' "$WG_CONF" | sed 's/^ListenPort[[:space:]]*=[[:space:]]*//')
+    [[ -n "$wg_addr" && -n "$priv_key" ]] || { warn "未能从现有配置解析出 Address/PrivateKey，迁移中止"; return 1; }
+
+    local default_iface
+    default_iface=$(ip route show default | awk '/default/{print $5}' | head -1)
+    if [[ -z "$default_iface" ]]; then
+        warn "未找到默认出网网卡，路由转发规则可能失效"
+        default_iface="eth0"
+    fi
+
+    local was_up=false
+    _iface_is_up && was_up=true && info "接口运行中，迁移前将临时停止"
+    $was_up && _stop_iface_safe || true
+
+    local backup="${WG_CONF}.pre-ufw-migrate.$(date +%Y%m%d%H%M%S)"
+    cp "$WG_CONF" "$backup"
+    chmod 600 "$backup"
+    info "已备份原配置: $backup"
+
+    local tmp
+    tmp=$(mktemp "${WG_DIR}/.wg_conf.XXXXXX")
+    chmod 600 "$tmp"
+    {
+        printf '[Interface]\n'
+        printf 'Address = %s\n' "$wg_addr"
+        printf 'PrivateKey = %s\n' "$priv_key"
+        printf 'ListenPort = %s\n' "${listen_port:-$WG_PORT}"
+        printf '# 防火墙规则由 UFW 管理，见 /etc/ufw/before.rules 与 ufw route 规则（本脚本自动生成）\n'
+        printf '\n'
+        # 从第一个 [Peer] 开始的内容原样保留，节点/密钥/Endpoint 都不动
+        awk '/^\[Peer\]/{f=1} f' "$WG_CONF"
+    } > "$tmp"
+
+    mv "$tmp" "$WG_CONF"
+    chmod 600 "$WG_CONF"
+
+    _ufw_setup_forwarding "$default_iface" "$wg_addr"
+    log "迁移完成，节点配置保持不变，原配置已备份为 $(basename "$backup")"
+
+    if $was_up; then
+        info "正在重新启动接口..."
+        cmd_up || warn "接口重启失败，请手动执行「启动接口」"
+    fi
+}
+
 cmd_add_peer() {
     require_conf
     local PUB_KEY="$1" ALLOWED_IPS="$2" ENDPOINT="${3:-}"
@@ -1024,6 +1081,9 @@ menu_main() {
         echo "  15. 备份配置"
         echo "  16. 恢复配置"
         echo "  "
+        echo "  [ 防火墙 ]"
+        echo "  17. 迁移现有配置到 UFW 模式（保留节点，不重新初始化）"
+        echo "  "
         echo "  0.  退出面板"
         echo
         local CHOICE
@@ -1074,6 +1134,7 @@ menu_main() {
             14) _run "实时流量监控"       cmd_monitor ;;
             15) _run "备份配置"           cmd_backup ;;
             16) _run "恢复配置"           cmd_restore ;;
+            17) _run "迁移到 UFW 模式"    cmd_migrate_ufw ;;
             0)  echo; exit 0 ;;
             *)  ;;
         esac
