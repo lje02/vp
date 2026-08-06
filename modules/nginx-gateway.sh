@@ -2442,8 +2442,231 @@ site_remove_acl() {
 }
 
 # ──────────────────────────────────────────────────────────
-# 限流
+# 自定义错误页 (403 / 404 / 50x)
 # ──────────────────────────────────────────────────────────
+
+# 生成一个简洁的默认错误页 HTML
+# 用法: _errorpage_default_html <状态码> <标题> <说明>
+_errorpage_default_html() {
+    local code="$1" title="$2" desc="$3"
+    cat <<EOF
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>${code} ${title}</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0f1115; color:#e8e8ea; font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif; }
+  .box { text-align:center; padding:40px; }
+  .code { font-size:88px; font-weight:700; letter-spacing:2px; color:#5b8def; margin:0; }
+  .title { font-size:22px; margin:12px 0 8px; }
+  .desc { font-size:14px; color:#9a9ba3; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <p class="code">${code}</p>
+    <p class="title">${title}</p>
+    <p class="desc">${desc}</p>
+  </div>
+</body>
+</html>
+EOF
+}
+
+# 将 include 指令注入到第一个 "location / {" 块的**结束大括号之后**（作为
+# server{} 的同级指令），而不是塞进 location / 内部——这样 error_page 才能
+# 在整个 server 块生效（同时覆盖 ACL 的 403、代理的 502/504、静态资源 404 等），
+# 而对应的 "location = /xxx.html { internal; }" 也需要与 location / 平级，
+# 不能嵌套在其内部。用 python3 做大括号计数，避免 sed 处理嵌套 { } 出错。
+_errorpage_inject_after_location_root() {
+    local conf="$1" block_file="$2"
+
+    if command -v python3 &>/dev/null; then
+        python3 - "$conf" "$block_file" <<'PYINJECT'
+import sys, re
+conf_path, block_path = sys.argv[1], sys.argv[2]
+txt = open(conf_path).read()
+block = open(block_path).read()
+m = re.search(r'[ \t]*location\s+/\s*\{', txt)
+if not m:
+    sys.exit(1)
+i = m.end()
+depth = 1
+n = len(txt)
+while i < n and depth > 0:
+    if txt[i] == '{':
+        depth += 1
+    elif txt[i] == '}':
+        depth -= 1
+    i += 1
+if depth != 0:
+    sys.exit(2)
+new_txt = txt[:i] + '\n' + block + txt[i:]
+open(conf_path, 'w').write(new_txt)
+sys.exit(0)
+PYINJECT
+        return $?
+    fi
+
+    # 没有 python3：退化为追加到文件末尾最后一个 "}" 之前（server 块结尾）
+    warn "未检测到 python3，退化为追加到配置文件末尾（请自行检查大括号是否正确嵌套）"
+    local tmp; tmp=$(mktemp)
+    head -n -1 "$conf" > "$tmp" 2>/dev/null || cp "$conf" "$tmp"
+    cat "$block_file" >> "$tmp"
+    echo "}" >> "$tmp"
+    mv "$tmp" "$conf"
+    return 0
+}
+
+site_add_errorpage() {
+    require_root; init_dirs
+
+    local domain=""
+    safe_read -rp "要配置错误页的域名: " domain
+    [[ -z "$domain" ]] && die "域名不能为空"
+
+    local conf="${SITES_AVAILABLE}/${domain}.conf"
+    [[ ! -f "$conf" ]] && die "找不到站点配置: ${conf}，请先创建站点（重定向站点没有实际内容，不支持自定义错误页）"
+    grep -qE '^[[:space:]]*location[[:space:]]*/[[:space:]]*\{' "$conf" \
+        || die "该站点配置中未找到 location / 块，无法定位注入位置，请检查配置文件"
+
+    echo ""
+    echo -e "${CYAN}── 选择要自定义的错误页 ──${NC}"
+    echo "  1) 403 Forbidden（ACL 拦截、权限拒绝）"
+    echo "  2) 404 Not Found（页面不存在）"
+    echo "  3) 50x 网关错误（500/502/503/504，后端挂了/超时）"
+    echo "  4) 以上全部"
+    safe_read -rp "选择 [1-4，默认 4]: " _ep_choice
+    _ep_choice="${_ep_choice:-4}"
+
+    local want_403=false want_404=false want_50x=false
+    case "$_ep_choice" in
+        1) want_403=true ;;
+        2) want_404=true ;;
+        3) want_50x=true ;;
+        4) want_403=true; want_404=true; want_50x=true ;;
+        *) die "无效选项" ;;
+    esac
+
+    local page_dir="${WEBROOT_BASE}/_error_pages/${domain}"
+    mkdir -p "$page_dir"
+
+    local use_custom=false
+    if confirm "是否使用自己准备好的 HTML 文件（而不是自动生成的默认样式）？"; then
+        use_custom=true
+    fi
+
+    _write_one_page() {
+        local code="$1" title="$2" desc="$3" file="$4"
+        if $use_custom; then
+            local src=""
+            safe_read -rp "请输入 ${code} 页面的 HTML 文件绝对路径: " src
+            if [[ -f "$src" ]]; then
+                cp "$src" "$file"
+                success "已使用自定义文件: $src → $file"
+            else
+                warn "文件不存在: ${src}，改用默认页面"
+                _errorpage_default_html "$code" "$title" "$desc" > "$file"
+            fi
+        else
+            _errorpage_default_html "$code" "$title" "$desc" > "$file"
+        fi
+    }
+
+    local block=""
+    if $want_403; then
+        _write_one_page "403" "访问被拒绝" "您没有权限访问此页面" "${page_dir}/403.html"
+        block+="    error_page 403 /__errpage_403.html;\n"
+        block+="    location = /__errpage_403.html {\n        internal;\n        alias ${page_dir}/403.html;\n    }\n"
+    fi
+    if $want_404; then
+        _write_one_page "404" "页面未找到" "您访问的页面不存在或已被移除" "${page_dir}/404.html"
+        block+="    error_page 404 /__errpage_404.html;\n"
+        block+="    location = /__errpage_404.html {\n        internal;\n        alias ${page_dir}/404.html;\n    }\n"
+    fi
+    if $want_50x; then
+        _write_one_page "50x" "服务暂时不可用" "服务器繁忙或正在维护，请稍后重试" "${page_dir}/50x.html"
+        block+="    error_page 500 502 503 504 /__errpage_50x.html;\n"
+        block+="    location = /__errpage_50x.html {\n        internal;\n        alias ${page_dir}/50x.html;\n    }\n"
+    fi
+    chmod -R 755 "$page_dir"
+
+    local snippet_file="${SNIPPET_DIR}/errorpage-${domain}.conf"
+    {
+        echo "# 自定义错误页 — 域名: ${domain}  生成时间: $(date)"
+        echo -e "$block"
+    } > "$snippet_file"
+    success "错误页片段已写入: $snippet_file"
+
+    local marker="include ${snippet_file};"
+    if grep -qF "$marker" "$conf"; then
+        info "已存在错误页 include，配置已更新，无需重复注入"
+    else
+        cp "$conf" "${conf}.bak.$(date +%s)"
+        printf '    %s\n' "$marker" > "${snippet_file}.inc"
+        _errorpage_inject_after_location_root "$conf" "${snippet_file}.inc"
+        local rc=$?
+        rm -f "${snippet_file}.inc"
+        if [[ $rc -ne 0 ]]; then
+            die "自动注入失败（大括号可能不匹配），请手动在 location / {} 之后添加: include ${snippet_file};"
+        fi
+        success "已将错误页 include 注入到站点配置（location / 之后，与其同级）"
+    fi
+
+    nginx -t 2>&1 >&2 || die "Nginx 配置检查失败，请修正后重试（可从 ${conf}.bak.<时间戳> 恢复）"
+    nginx_reload
+    success "${domain} 的自定义错误页已生效"
+}
+
+site_remove_errorpage() {
+    require_root; init_dirs
+
+    local domain=""
+    safe_read -rp "要移除自定义错误页的域名: " domain
+    [[ -z "$domain" ]] && die "域名不能为空"
+
+    local conf="${SITES_AVAILABLE}/${domain}.conf"
+    local snippet_file="${SNIPPET_DIR}/errorpage-${domain}.conf"
+    local page_dir="${WEBROOT_BASE}/_error_pages/${domain}"
+    local removed=0
+
+    if [[ -f "$conf" ]] && grep -qF "include ${snippet_file};" "$conf"; then
+        cp "$conf" "${conf}.bak.$(date +%s)"
+        sed -i "\|include ${snippet_file};|d" "$conf"
+        success "已从 ${conf} 移除错误页 include（已备份为 ${conf}.bak.<时间戳>）"
+        removed=1
+    fi
+
+    if [[ -f "$snippet_file" ]]; then
+        rm -f "$snippet_file"
+        success "已删除错误页片段: $snippet_file"
+        removed=1
+    fi
+
+    if [[ -d "$page_dir" ]]; then
+        if confirm "是否同时删除错误页 HTML 文件目录 ${page_dir}？"; then
+            rm -rf "$page_dir"
+            success "已删除: $page_dir"
+        else
+            info "保留 HTML 文件目录: $page_dir"
+        fi
+        removed=1
+    fi
+
+    if [[ $removed -eq 0 ]]; then
+        warn "未找到 ${domain} 的自定义错误页配置，无需移除"
+        return
+    fi
+
+    if [[ -f "$conf" ]]; then
+        nginx -t 2>&1 >&2 || die "Nginx 配置检查失败，请检查 ${conf}，必要时用备份文件恢复"
+    fi
+    nginx_reload
+    success "已移除 ${domain} 的自定义错误页"
+}
+
 site_add_ratelimit() {
     require_root; init_dirs
 
@@ -2977,6 +3200,8 @@ ${BOLD}安全增强:${NC}
   site acl                为站点添加 IP 白/黑名单 或 Basic Auth 认证
   site ratelimit          为站点添加限流（limit_req_zone，防刷接口）
   site ratelimit-remove   移除站点的限流配置
+  site errorpage          为站点自定义 403/404/50x 错误页
+  site errorpage-remove   移除站点的自定义错误页
  
 ${BOLD}证书管理:${NC}
   cert issue              申请 Let's Encrypt 证书
@@ -3074,9 +3299,11 @@ interactive_menu() {
         echo " 29) Cloudflare 真实 IP 管理"
         echo " 30) 移除限流规则"
         echo " 31) 卸载 Nginx 及配置"
+        echo " 32) 自定义错误页 (403/404/50x)"
+        echo " 33) 移除自定义错误页"
         echo "  0) 退出"
         echo ""
-        safe_read -rp "请选择 [0-31]: " choice
+        safe_read -rp "请选择 [0-33]: " choice
 
         case "$choice" in
              1) site_create_static ;;
@@ -3124,6 +3351,8 @@ interactive_menu() {
                 ;;
             30) site_remove_ratelimit ;;
             31) nginx_uninstall ;;
+            32) site_add_errorpage ;;
+            33) site_remove_errorpage ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
@@ -3160,6 +3389,8 @@ main() {
                 acl)         site_add_acl ;;
                 ratelimit)   site_add_ratelimit ;;
                 ratelimit-remove) site_remove_ratelimit ;;
+                errorpage)   site_add_errorpage ;;
+                errorpage-remove) site_remove_errorpage ;;
                 enable)      site_enable "${1:-}" ;;
                 disable)     site_disable "${1:-}" ;;
                 delete)      site_delete "${1:-}" ;;
