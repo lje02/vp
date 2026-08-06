@@ -329,6 +329,95 @@ nginx_update() {
     fi
 }
 
+nginx_uninstall() {
+    require_root
+    command -v nginx &>/dev/null || warn "未检测到 nginx 命令，可能已卸载或未安装，继续按流程清理残留文件"
+
+    echo ""
+    echo -e "${RED}${BOLD}── 卸载 Nginx ──${NC}"
+    echo "这是破坏性操作，请选择清理范围："
+    echo "  1) 仅卸载 Nginx 软件包（保留 /etc/nginx 全部配置、证书、网站文件、备份）"
+    echo "  2) 卸载软件包 + 删除 /etc/nginx 配置（保留 Let's Encrypt 证书、网站文件、本脚本备份）"
+    echo "  3) 彻底清除：软件包 + /etc/nginx 配置 + 本脚本备份目录（${BACKUP_DIR}）"
+    echo "     仍保留 Let's Encrypt 证书（/etc/letsencrypt）与网站文件（${WEBROOT_BASE}），这两项需单独确认删除"
+    echo "  0) 取消"
+    echo ""
+    local level
+    safe_read -rp "请选择 [0-3，默认 0]: " level
+    [[ -z "$level" ]] && level="0"
+    [[ "$level" == "0" ]] && { info "已取消"; return; }
+    [[ "$level" =~ ^[123]$ ]] || die "无效选项"
+
+    echo ""
+    warn "即将执行：$( [[ $level == 1 ]] && echo "卸载 nginx 软件包" )$( [[ $level == 2 ]] && echo "卸载 nginx 软件包 + 删除 /etc/nginx 下全部配置" )$( [[ $level == 3 ]] && echo "卸载 nginx 软件包 + 删除 /etc/nginx 配置 + 删除脚本备份目录" )"
+    local confirm_word
+    safe_read -rp "此操作不可逆，请输入 UNINSTALL 以确认: " confirm_word
+    [[ "$confirm_word" == "UNINSTALL" ]] || { info "确认字符串不匹配，已取消"; return; }
+
+    # 卸载前自动打一份配置备份，万一想反悔至少能找回配置文件内容
+    if [[ -d "$NGINX_CONF_DIR" ]]; then
+        info "卸载前自动备份一次现有配置..."
+        config_backup || warn "自动备份失败，继续卸载流程"
+    fi
+
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl stop nginx || warn "停止 nginx 服务失败，继续卸载"
+    fi
+    systemctl disable nginx &>/dev/null || true
+
+    if command -v nginx &>/dev/null; then
+        local mgr; mgr=$(detect_pkg_manager)
+        info "正在卸载 nginx 软件包（${mgr}）..."
+        case $mgr in
+            apt)    apt-get remove -y nginx nginx-common nginx-core nginx-full nginx-light nginx-extras 2>/dev/null || apt-get remove -y nginx ;;
+            dnf)    dnf remove -y nginx ;;
+            yum)    yum remove -y nginx ;;
+            pacman) pacman -Rns --noconfirm nginx ;;
+        esac
+        success "nginx 软件包已卸载"
+    fi
+
+    if [[ "$level" -ge 2 ]]; then
+        if [[ -d "$NGINX_CONF_DIR" ]]; then
+            rm -rf "${NGINX_CONF_DIR:?}"
+            success "已删除配置目录: $NGINX_CONF_DIR"
+        fi
+        [[ -f "$LOG_FILE" ]] && { rm -f "$LOG_FILE"; info "已删除日志: $LOG_FILE"; }
+    fi
+
+    if [[ "$level" -eq 3 ]]; then
+        if [[ -d "$BACKUP_DIR" ]]; then
+            if confirm "确认删除脚本备份目录 ${BACKUP_DIR}（内含之前 config_backup 生成的所有归档，删除后无法回滚）？"; then
+                rm -rf "${BACKUP_DIR:?}"
+                success "已删除备份目录: $BACKUP_DIR"
+            else
+                info "保留备份目录: $BACKUP_DIR"
+            fi
+        fi
+    fi
+
+    echo ""
+    if [[ -d "$LE_CERT_BASE" ]] || [[ -d "/etc/letsencrypt" ]]; then
+        if confirm "是否同时删除 Let's Encrypt 证书（/etc/letsencrypt，包含私钥，删除后需重新申请）？"; then
+            rm -rf /etc/letsencrypt
+            success "已删除 /etc/letsencrypt"
+        else
+            info "保留 /etc/letsencrypt"
+        fi
+    fi
+    if [[ -d "$WEBROOT_BASE" ]]; then
+        if confirm "是否同时删除网站文件目录（${WEBROOT_BASE}，包含所有站点的实际文件）？"; then
+            validate_safe_path "$WEBROOT_BASE"
+            rm -rf "${WEBROOT_BASE:?}"
+            success "已删除 $WEBROOT_BASE"
+        else
+            info "保留 $WEBROOT_BASE"
+        fi
+    fi
+
+    success "Nginx 卸载流程完成"
+}
+
 check_sub_filter_module() {
     if ! nginx -V 2>&1 | grep -q "http_sub_module"; then
         warn "当前 Nginx 未编译 http_sub_module，镜像模式的内容替换功能不可用。"
@@ -2408,7 +2497,7 @@ site_add_ratelimit() {
 
     # 自动将 limit_req / limit_conn 注入到站点 location / 块（避免手动编辑）
     local inject_lines="limit_req zone=${zone_name} burst=${_burst}${nodelay_flag};"
-    [[ -n "$conn_limit" ]] && inject_lines="${inject_lines}\n        limit_conn zone=${conn_zone_name} ${conn_limit};"
+    [[ -n "$conn_limit" ]] && inject_lines="${inject_lines}\n        limit_conn ${conn_zone_name} ${conn_limit};"
 
     local marker="limit_req zone=${zone_name}"
     if grep -qF "$marker" "$conf"; then
@@ -2422,6 +2511,54 @@ site_add_ratelimit() {
 
     warn "请确认 nginx.conf 的 http{} 中已 include /etc/nginx/conf.d/*.conf"
     nginx_reload
+}
+
+site_remove_ratelimit() {
+    require_root; init_dirs
+
+    local domain=""
+    safe_read -rp "要移除限流的域名: " domain
+    [[ -z "$domain" ]] && die "域名不能为空"
+
+    local conf="${SITES_AVAILABLE}/${domain}.conf"
+    local zone_name="limit_${domain//./_}"
+    local conn_zone_name="conn_${domain//./_}"
+    local rl_conf="${NGINX_CONF_DIR}/conf.d/ratelimit-${domain}.conf"
+
+    local found=false
+
+    # 1. 删掉站点配置里注入的 limit_req / limit_conn 两行
+    if [[ -f "$conf" ]] && grep -qE "limit_req zone=${zone_name}|limit_conn[[:space:]]+(zone=)?${conn_zone_name}" "$conf"; then
+        found=true
+        cp "$conf" "${conf}.bak.$(date +%s)"
+        sed -i -E "/limit_req zone=${zone_name}/d; /limit_conn[[:space:]]+(zone=)?${conn_zone_name}/d" "$conf"
+        success "已从站点配置移除限流指令: $conf（已备份为 ${conf}.bak.<时间戳>）"
+    else
+        info "站点配置中未发现该域名的限流指令，跳过"
+    fi
+
+    # 2. 删掉 zone 声明文件
+    if [[ -f "$rl_conf" ]]; then
+        found=true
+        rm -f "$rl_conf"
+        success "已删除限流 zone 配置: $rl_conf"
+    else
+        info "未发现限流 zone 配置文件: $rl_conf"
+    fi
+
+    if ! $found; then
+        warn "未找到 ${domain} 的任何限流配置，无需移除"
+        return
+    fi
+
+    if [[ -f "$conf" ]]; then
+        if ! nginx -t &>/dev/null; then
+            warn "移除后 nginx -t 校验失败，请检查 ${conf}，必要时用备份文件恢复"
+            return
+        fi
+    fi
+    nginx_reload
+    success "已移除 ${domain} 的限流配置"
 }
 
 # ──────────────────────────────────────────────────────────
@@ -2839,6 +2976,7 @@ ${BOLD}站点管理:${NC}
 ${BOLD}安全增强:${NC}
   site acl                为站点添加 IP 白/黑名单 或 Basic Auth 认证
   site ratelimit          为站点添加限流（limit_req_zone，防刷接口）
+  site ratelimit-remove   移除站点的限流配置
  
 ${BOLD}证书管理:${NC}
   cert issue              申请 Let's Encrypt 证书
@@ -2860,6 +2998,7 @@ ${BOLD}Nginx 控制:${NC}
   nginx reload            检查语法并重载配置
   nginx restart           重启 Nginx
   nginx status            查看运行状态
+  nginx uninstall         卸载 Nginx 及配置（分级选择清理范围，需二次确认）
  
 ${BOLD}Cloudflare 真实 IP（全局，影响本机所有站点，谨慎启用）:${NC}
   cf-realip install       启用：拉取 CF IP 段并信任 CF-Connecting-IP 头
@@ -2933,9 +3072,11 @@ interactive_menu() {
         echo " 27) 查看状态"
         echo " 28) 检查并更新 Nginx"
         echo " 29) Cloudflare 真实 IP 管理"
+        echo " 30) 移除限流规则"
+        echo " 31) 卸载 Nginx 及配置"
         echo "  0) 退出"
         echo ""
-        safe_read -rp "请选择 [0-29]: " choice
+        safe_read -rp "请选择 [0-31]: " choice
 
         case "$choice" in
              1) site_create_static ;;
@@ -2981,6 +3122,8 @@ interactive_menu() {
                     *) cmd_cf_realip status ;;
                 esac
                 ;;
+            30) site_remove_ratelimit ;;
+            31) nginx_uninstall ;;
              0) echo "再见！"; exit 0 ;;
              *) warn "无效选项，请重试" ;;
         esac
@@ -3016,6 +3159,7 @@ main() {
                 loadbalance) site_create_loadbalance ;;
                 acl)         site_add_acl ;;
                 ratelimit)   site_add_ratelimit ;;
+                ratelimit-remove) site_remove_ratelimit ;;
                 enable)      site_enable "${1:-}" ;;
                 disable)     site_disable "${1:-}" ;;
                 delete)      site_delete "${1:-}" ;;
@@ -3048,6 +3192,7 @@ main() {
                 reload)      nginx_reload ;;
                 restart)     nginx_restart ;;
                 status)      nginx_status ;;
+                uninstall)   nginx_uninstall ;;
                 *)           show_help ;;
             esac ;;
         cf-realip)
