@@ -195,7 +195,7 @@ main_menu() {
         echo -e "19. MaraDB+Reids"
         echo -e "20. wordpress 多节点部署"
         echo -e "21. postgres+redis"
-        echo -e "22. 安全检测"
+        echo -e "22. 安全检查"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部       x. 卸载       0. 退出"
         echo -e "--------------------------------------------"
