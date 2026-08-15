@@ -44,6 +44,7 @@ MODULES_LIST=(
     "infra-shared.sh"
     "wp-deploy.sh"
     "pg-redis-shared.sh"
+    "vps-security-check.sh"
 
 )
 
@@ -194,6 +195,7 @@ main_menu() {
         echo -e "19. MaraDB+Reids"
         echo -e "20. wordpress 多节点部署"
         echo -e "21. postgres+redis"
+        echo -e "22. 安全检测"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部       x. 卸载       0. 退出"
         echo -e "--------------------------------------------"
@@ -221,6 +223,7 @@ main_menu() {
             19) run_module "infra-shared.sh" ;;
             20) run_module "wp-deploy.sh" ;;
             21) run_module "pg-redis-shared.sh" ;;
+            22) run_module "vps-security-check.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
