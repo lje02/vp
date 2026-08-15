@@ -71,6 +71,7 @@ BASE_MODULES=(
     "logs.sh"
     "wireguard-mesh.sh"
     "nginx-gateway.sh"
+    "vps-security-check.sh"
 )
 
 # 动态提取主控中的 MODULES_LIST
