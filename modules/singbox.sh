@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ========================================================
-# sing-box 综合管理脚本  v2.4  (Hysteria2强制BBR + 官方仓库安装 + Hysteria2 obfs + AnyTLS padding_scheme)
+# sing-box 综合管理脚本  v2.7  (Hysteria2强制BBR + 官方仓库安装 + Hysteria2 obfs + AnyTLS padding_scheme)
 # ========================================================
 
 RED='\033[1;31m'
@@ -137,6 +137,12 @@ init_config() {
         echo '{"log":{"level":"info"},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}' > "$CONFIG_FILE"
     fi
 }
+# [v2.7] 内核版本 >= $1 ? (去掉 -alpha/-beta 后缀后比较)
+_sb_ver_ge() {
+    local v; v=$($SB_BIN version 2>/dev/null | awk '/version/{print $3}'); v=${v%%-*}
+    [[ -n "$v" && "$(printf '%s\n%s\n' "$v" "$1" | sort -V | head -n1)" == "$1" ]]
+}
+
 # ============================================================
 # 节点订阅辅助函数：刷新订阅文件
 # ============================================================
@@ -652,7 +658,7 @@ add_node() {
             ;;
 
         2|3|7|8) # 需要证书的协议
-            local p_type def_p usr_json tls_json PASS SNI_NAME ALLOW_INS OBFS_JSON="null"
+            local p_type def_p usr_json tls_json PASS SNI_NAME ALLOW_INS OBFS_JSON="null" MASQ_JSON="null"
             case $choice in
                 2) p_type="tuic";     def_p=8443 ;;
                 3) p_type="hysteria2";def_p=443  ;;
@@ -705,13 +711,35 @@ add_node() {
                     local OBFS_TYPE=""
                     case "$obfs_choice" in
                         2) OBFS_TYPE="salamander" ;;
-                        3) OBFS_TYPE="gecko" ;;
+                        3) local _sbv; _sbv=$($SB_BIN version 2>/dev/null | awk '/version/{print $3}'); _sbv=${_sbv%%-*}
+                           if [[ -n "$_sbv" && "$(printf '%s\n1.14.0\n' "$_sbv" | sort -V | head -n1)" == "1.14.0" ]]; then
+                               OBFS_TYPE="gecko"
+                           else
+                               echo -e "${RED}✘ 当前内核 ${_sbv:-未知} 不支持 Gecko（需 ≥1.14.0），请先用菜单 5 更新内核；本次不启用混淆${PLAIN}"
+                           fi ;;
                     esac
                     if [[ -n "$OBFS_TYPE" ]]; then
                         local OBFS_PASS; OBFS_PASS=$(gen_pass)
                         OBFS_JSON=$(jq -n --arg t "$OBFS_TYPE" --arg p "$OBFS_PASS" '{"type":$t,"password":$p}')
                         LINK_Q="${LINK_Q}&obfs=${OBFS_TYPE}&obfs-password=${OBFS_PASS}"
                         echo -e "${GREEN}✔ 已启用 $OBFS_TYPE 混淆，密码: $OBFS_PASS${PLAIN}"
+                    fi
+
+                    # [v2.7] masquerade：认证失败的 HTTP/3 请求的表现（默认返回 404）
+                    echo -e "\n${YELLOW}--- Hysteria2 伪装站点 masquerade（可选）---${PLAIN}"
+                    echo "认证失败/被主动探测的 HTTP/3 请求将反代到该站点；留空则返回 404"
+                    read -p "反代目标 URL (如 https://www.bing.com，回车跳过): " MASQ_URL
+                    if [[ -n "$MASQ_URL" ]]; then
+                        if [[ "$MASQ_URL" =~ ^https?://[^[:space:]\"]+$ ]]; then
+                            if _sb_ver_ge 1.14.0; then
+                                MASQ_JSON=$(jq -n --arg u "$MASQ_URL" '{"type":"proxy","url":$u,"rewrite_host":true}')
+                            else
+                                MASQ_JSON=$(jq -n --arg u "$MASQ_URL" '$u')
+                            fi
+                            echo -e "${GREEN}✔ 已设置伪装站点: $MASQ_URL${PLAIN}"
+                        else
+                            echo -e "${YELLOW}URL 格式无效，已跳过 masquerade${PLAIN}"
+                        fi
                     fi
 
                     LINK="hysteria2://$PASS@$IP:$PORT?${LINK_Q}#$TAG" ;;
@@ -727,11 +755,13 @@ add_node() {
             # 强制客户端使用 BBR 拥塞控制，避免退化为旧版 Hysteria CC 导致性能不稳定；
             # 若启用了 obfs 混淆则一并写入
             jq --arg port "$PORT" --arg type "$p_type" --arg tag "$TAG" \
-               --argjson users "$usr_json" --argjson tls "$tls_json" --argjson obfs "$OBFS_JSON" \
+               --argjson users "$usr_json" --argjson tls "$tls_json" --argjson obfs "$OBFS_JSON" --argjson masq "$MASQ_JSON" \
                '.inbounds += [({"type":$type,"tag":$tag,"listen":"::","listen_port":($port|tonumber),
                  "users":$users,"tls":$tls}
                  + (if $type=="hysteria2" then {"ignore_client_bandwidth":true} else {} end)
-                 + (if ($type=="hysteria2" and $obfs != null) then {"obfs":$obfs} else {} end))]' \
+                 + (if $type=="tuic" then {"congestion_control":"bbr"} else {} end)
+                 + (if ($type=="hysteria2" and $obfs != null) then {"obfs":$obfs} else {} end)
+                 + (if ($type=="hysteria2" and $masq != null) then {"masquerade":$masq} else {} end))]' \
                "$CONFIG_FILE" > "$_TMP_JSON"
             ;;
 
@@ -794,11 +824,27 @@ add_node() {
             # 安全修复：AnyTLS 自签警告
             echo -e "${YELLOW}⚠️ 警告: [AnyTLS] 属于 TCP 协议！${PLAIN}"
             echo -e "${YELLOW}在公网使用自签名证书极易被防火墙特征识别并秒封 IP！${PLAIN}"
-            echo -e "${YELLOW}👉 强烈建议优先选择 [2. 自动检测 ACME 证书]${PLAIN}"
+            echo -e "${YELLOW}👉 强烈建议优先选择 [3. Reality] 或 [2. 自动检测 ACME 证书]${PLAIN}"
             
-            echo " 1. 自签名证书  2. 自动检测 ACME 证书 ($CERT_DIR)"
+            echo " 1. 自签名证书  2. 自动检测 ACME 证书 ($CERT_DIR)  3. Reality（无需证书）"
             read -p "证书类型: " c_choice
-            if [[ "$c_choice" == "2" ]]; then
+            local AT_REALITY=0 AT_PBK="" AT_SID="" AT_TLS_JSON=""
+            if [[ "$c_choice" == "3" ]]; then
+                # [v2.7] AnyTLS + Reality：复用 VLESS Reality 的密钥与握手配置，无需域名/证书
+                AT_REALITY=1
+                read -p "目标 SNI (默认 music.apple.com): " SNI_NAME; SNI_NAME=${SNI_NAME:-music.apple.com}
+                local AT_KEYS AT_PRIV
+                AT_KEYS=$($SB_BIN generate reality-keypair)
+                AT_PRIV=$(echo "$AT_KEYS" | awk -F': ' '/Private/{print $2}' | tr -d '[:space:]')
+                AT_PBK=$(echo  "$AT_KEYS" | awk -F': ' '/Public/{print $2}'  | tr -d '[:space:]')
+                if [[ -z "$AT_PRIV" || -z "$AT_PBK" ]]; then
+                    echo -e "${RED}✘ Reality 密钥生成失败${PLAIN}"; pause; return; fi
+                AT_SID=$(openssl rand -hex 8); ALLOW_INS=0
+                AT_TLS_JSON=$(jq -n --arg sni "$SNI_NAME" --arg priv "$AT_PRIV" --arg sid "$AT_SID" \
+                    '{"enabled":true,"server_name":$sni,
+                      "reality":{"enabled":true,"handshake":{"server":$sni,"server_port":443},
+                        "private_key":$priv,"short_id":[$sid]}}')
+            elif [[ "$c_choice" == "2" ]]; then
                 read -p "对应域名: " domain; find_certs "$domain"
                 [[ -z "$CERT_PATH" ]] && echo -e "${RED}✘ 未找到证书${PLAIN}" && pause && return
                 SNI_NAME="$domain"; ALLOW_INS=0
@@ -808,6 +854,10 @@ add_node() {
                     -newkey ec:<(openssl ecparam -name prime256v1) \
                     -keyout "$KEY_PATH" -out "$CERT_PATH" -subj "/CN=icloud.com" -days 3650 2>/dev/null
                 SNI_NAME="icloud.com"; ALLOW_INS=1
+            fi
+            if [[ "$AT_REALITY" -eq 0 ]]; then
+                AT_TLS_JSON=$(jq -n --arg sni "$SNI_NAME" --arg cert "$CERT_PATH" --arg key "$KEY_PATH" \
+                    '{"enabled":true,"server_name":$sni,"certificate_path":$cert,"key_path":$key}')
             fi
 
             # [升级] AnyTLS padding_scheme：流量填充方案，对抗基于包长分布的被动流量识别
@@ -823,7 +873,11 @@ add_node() {
                 echo "  1=100-400"
                 echo "  2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000"
                 echo "  3=9-9,500-1000"
-                echo "  4=500-1000  5=500-1000  6=500-1000  7=500-1000"
+                echo "  4=500-1000"
+                echo "  5=500-1000"
+                echo "  6=500-1000"
+                echo "  7=500-1000"
+                echo -e "  ${YELLOW}(每行只能输入一条规则，需分别输入)${PLAIN}"
                 local pad_lines=() pad_line
                 while true; do
                     read -p "  第$(( ${#pad_lines[@]} + 1 ))行 (留空结束): " pad_line
@@ -840,15 +894,27 @@ add_node() {
 
             make_tmp
             jq --arg port "$PORT" --arg pass "$PASS" --arg tag "$TAG" \
-               --arg sni "$SNI_NAME" --arg cert "$CERT_PATH" --arg key "$KEY_PATH" \
+               --argjson tls "$AT_TLS_JSON" \
                --argjson padding "$PADDING_JSON" \
                '.inbounds += [({"type":"anytls","tag":$tag,"listen":"::","listen_port":($port|tonumber),
                  "users":[{"name":"default_user","password":$pass}],
-                 "tls":{"enabled":true,"server_name":$sni,"certificate_path":$cert,"key_path":$key}}
+                 "tls":$tls}
                  + (if $padding != null then {"padding_scheme":$padding} else {} end))]' \
                "$CONFIG_FILE" > "$_TMP_JSON"
             
-            LINK="anytls://${PASS}@${IP}:${PORT}?sni=${SNI_NAME}&allow_insecure=${ALLOW_INS}#${TAG}"
+            if [[ "$AT_REALITY" -eq 1 ]]; then
+                LINK="anytls://${PASS}@${IP}:${PORT}?security=reality&sni=${SNI_NAME}&fp=chrome&pbk=${AT_PBK}&sid=${AT_SID}&type=tcp#${TAG}"
+                echo -e "\n${YELLOW}提示: anytls:// 链接里的 Reality 参数不是统一标准，部分客户端可能无法导入。${PLAIN}"
+                echo -e "${YELLOW}sing-box 客户端可直接使用以下出站配置:${PLAIN}"
+                jq -n --arg t "$TAG" --arg s "$IP" --arg p "$PORT" --arg pw "$PASS" \
+                    --arg sni "$SNI_NAME" --arg pbk "$AT_PBK" --arg sid "$AT_SID" \
+                    '{"type":"anytls","tag":$t,"server":$s,"server_port":($p|tonumber),"password":$pw,
+                      "tls":{"enabled":true,"server_name":$sni,
+                             "utls":{"enabled":true,"fingerprint":"chrome"},
+                             "reality":{"enabled":true,"public_key":$pbk,"short_id":$sid}}}'
+            else
+                LINK="anytls://${PASS}@${IP}:${PORT}?sni=${SNI_NAME}&insecure=${ALLOW_INS}#${TAG}"
+            fi
             ;;
     esac
 
@@ -924,7 +990,12 @@ manage_configs() {
                 local PASS; PASS=$(echo "$CONF" | jq -r '.users[0].password // ""')
                 local INS;  INS=$(echo  "$CONF" | jq -r '.tls.insecure // false')
                 local IV=0; [[ "$INS" == "true" ]] && IV=1
-                echo -e "${BLUE}anytls://$PASS@$HOST:$PORT?sni=$SNI&insecure=$IV#$TAG${PLAIN}" ;;
+                if [[ -n "$(echo "$CONF" | jq -r '.tls.reality.short_id[0] // ""')" ]]; then
+                    echo -e "${RED}Reality 节点公钥 (pbk) 未存储于 config.json。${PLAIN}"
+                    echo -e "${YELLOW}请查看 $LINK_DIR/${TAG}.link，或删除重建该节点。${PLAIN}"
+                else
+                    echo -e "${BLUE}anytls://$PASS@$HOST:$PORT?sni=$SNI&insecure=$IV#$TAG${PLAIN}"
+                fi ;;
             http)
                 local USER PASS
                 USER=$(echo "$CONF" | jq -r '.users[0].username // ""')
@@ -1093,7 +1164,7 @@ parse_proxy_link() {
     local content qs host_port user_info
 
     hop_type="" R_ADDR="" R_PORT="" R_PASS="" R_USER="" R_METHOD=""
-    R_UUID="" R_SNI="" R_FLOW="" R_PBK="" R_SID="" R_ALPN=""
+    R_UUID="" R_SNI="" R_FLOW="" R_PBK="" R_SID="" R_ALPN="" R_FP="" R_OBFS="" R_OBFS_PW=""
     R_TLS_INSECURE="0" R_TRANSPORT="tcp" R_WS_PATH="" R_NAME=""
 
     R_NAME=$(echo "$link" | grep -oP '(?<=#)[^#]*$' | _urldecode 2>/dev/null || true)
@@ -1163,6 +1234,7 @@ parse_proxy_link() {
         R_FLOW=$(_qs_get "$qs" "flow")
         R_PBK=$(_qs_get "$qs" "pbk")
         R_SID=$(_qs_get "$qs" "sid")
+        R_FP=$(_qs_get "$qs" "fp")
         R_TRANSPORT=$(_qs_get "$qs" "type"); R_TRANSPORT=${R_TRANSPORT:-tcp}
         R_WS_PATH=$(_qs_get "$qs" "path")
         local ins; ins=$(_qs_get "$qs" "allowInsecure")
@@ -1204,6 +1276,7 @@ parse_proxy_link() {
             R_PORT=$(echo "$host_port" | cut -d':' -f2)
         fi
         R_SNI=$(_qs_get "$qs" "sni")
+        R_OBFS=$(_qs_get "$qs" "obfs"); R_OBFS_PW=$(_qs_get "$qs" "obfs-password")
         local ins; ins=$(_qs_get "$qs" "insecure")
         [[ "$ins" == "1" || "$ins" == "true" ]] && R_TLS_INSECURE="1"
 
@@ -1239,7 +1312,8 @@ parse_proxy_link() {
             R_PORT=$(echo "$host_port" | cut -d':' -f2)
         fi
         R_SNI=$(_qs_get "$qs" "sni"); [[ -z "$R_SNI" ]] && R_SNI=$(_qs_get "$qs" "host")
-        local ins; ins=$(_qs_get "$qs" "insecure")
+        R_PBK=$(_qs_get "$qs" "pbk"); R_SID=$(_qs_get "$qs" "sid"); R_FP=$(_qs_get "$qs" "fp")
+        local ins; ins=$(_qs_get "$qs" "insecure"); [[ -z "$ins" ]] && ins=$(_qs_get "$qs" "allow_insecure")
         [[ "$ins" == "1" || "$ins" == "true" ]] && R_TLS_INSECURE="1"
     fi
 }
@@ -1301,8 +1375,9 @@ link_to_outbound_json() {
             if [[ -n "$R_PBK" ]]; then
                 tls_obj=$(jq -n \
                     --arg sni "$R_SNI" --arg pbk "$R_PBK" --arg sid "$R_SID" \
-                    --argjson ins "$ins_bool" \
+                    --arg fp "${R_FP:-chrome}" --argjson ins "$ins_bool" \
                     '{"enabled":true,"server_name":$sni,"insecure":$ins,
+                      "utls":{"enabled":true,"fingerprint":$fp},
                       "reality":{"enabled":true,"public_key":$pbk,"short_id":$sid}}')
             else
                 tls_obj=$(jq -n \
@@ -1348,8 +1423,10 @@ link_to_outbound_json() {
             json=$(jq -n \
                 --arg t "$tag" --arg s "$R_ADDR" --arg p "$R_PORT" \
                 --arg pw "$R_PASS" --argjson tls "$tls_obj" \
+                --arg ot "$R_OBFS" --arg op "$R_OBFS_PW" \
                 '{"type":"hysteria2","tag":$t,"server":$s,
-                  "server_port":($p|tonumber),"password":$pw,"tls":$tls}')
+                  "server_port":($p|tonumber),"password":$pw,"tls":$tls}
+                 + (if $ot != "" then {"obfs":{"type":$ot,"password":$op}} else {} end)')
             ;;
         7) # TUIC — [F06]
             local alpn_json="[]"
@@ -1368,7 +1445,9 @@ link_to_outbound_json() {
         8) # AnyTLS - 客户端/出站只需 password
             local tls_obj
             tls_obj=$(jq -n --arg sni "$R_SNI" --argjson ins "$ins_bool" \
-                '{"enabled":true,"server_name":$sni,"insecure":$ins,"utls":{"enabled":true,"fingerprint":"chrome"}}')
+                --arg fp "${R_FP:-chrome}" --arg pbk "$R_PBK" --arg sid "$R_SID" \
+                '{"enabled":true,"server_name":$sni,"insecure":$ins,"utls":{"enabled":true,"fingerprint":$fp}}
+                 + (if $pbk != "" then {"reality":{"enabled":true,"public_key":$pbk,"short_id":$sid}} else {} end)')
             json=$(jq -n \
                 --arg t "$tag" --arg s "$R_ADDR" --arg p "$R_PORT" \
                 --arg pw "$R_PASS" --argjson tls "$tls_obj" \
@@ -1426,10 +1505,16 @@ manage_routing() {
                 echo -e "\n${CYAN}2. 匹配目标:${PLAIN}"
                 echo "1) 全部流量 | 2) 域名 | 3) GeoSite | 4) IP/CIDR"
                 read -p "选择 [1-4]: " target_type
-                local RULE_PART="{}"
+                local RULE_PART="{}" RS_JSON="[]"
                 case $target_type in
                     2) read -p "域名: " val; RULE_PART=$(echo "$val" | tr ',' '\n' | jq -R . | jq -s '{"domain":.}' -c) ;;
-                    3) read -p "GeoSite: " val; RULE_PART=$(echo "$val" | tr ',' '\n' | jq -R . | jq -s '{"geosite":.}' -c) ;;
+                    3) # [v2.5] geosite 字段已在 sing-box 1.12.0 移除，改用 SagerNet/sing-geosite 的远程规则集
+                       read -p "GeoSite 名称 (如 netflix,openai，逗号隔开): " val
+                       val=$(echo "$val" | tr -d ' ')
+                       if [[ -z "$val" || ! "$val" =~ ^[A-Za-z0-9@!,_-]+$ ]]; then
+                           echo -e "${RED}✘ 名称无效${PLAIN}"; pause; continue; fi
+                       RS_JSON=$(echo "$val" | tr ',' '\n' | awk NF | jq -R '{"type":"remote","tag":("geosite-"+.),"format":"binary","url":("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-"+.+".srs")}' | jq -s -c .)
+                       RULE_PART=$(echo "$RS_JSON" | jq -c '{"rule_set":[.[].tag]}') ;;
                     4) read -p "IP/CIDR: " val; RULE_PART=$(echo "$val" | tr ',' '\n' | jq -R . | jq -s '{"ip_cidr":.}' -c) ;;
                 esac
 
@@ -1494,8 +1579,9 @@ manage_routing() {
                     '. + {"outbound":$ot} + (if $it != null then {"inbound":$it} else {} end)' -c)
 
                 make_tmp
-                jq --argjson out_obj "$OUT_JSON" --argjson rule_obj "$RULE_JSON" \
-                   '.outbounds += [$out_obj] | .route.rules = [$rule_obj] + .route.rules' \
+                jq --argjson out_obj "$OUT_JSON" --argjson rule_obj "$RULE_JSON" --argjson rs "$RS_JSON" \
+                   '.outbounds += [$out_obj] | .route.rules = [$rule_obj] + .route.rules
+                    | . as $c | (if ($rs|length)>0 then .route.rule_set = (($c.route.rule_set // []) + [$rs[] | select(.tag as $t | (($c.route.rule_set // []) | map(.tag) | index($t)) == null)]) else . end)' \
                    "$CONFIG_FILE" > "$_TMP_JSON"
                 save_and_restart && echo -e "${GREEN}✔ 分流规则添加成功！${PLAIN}" \
                                  || echo -e "${RED}✖ 语法检查失败！${PLAIN}"
@@ -2014,6 +2100,49 @@ manage_outbounds() {
 # ============================================================
 # 节点订阅主管理模块
 # ============================================================
+# [v2.6] 订阅服务：只响应秘密路径，不再用 http.server（会列目录并暴露随机路径）
+write_sub_server() {
+    mkdir -p /var/www/singbox-sub
+    rm -f /var/www/singbox-sub/https_server.py
+    cat > /var/www/singbox-sub/sub_server.py <<'PYEOF2'
+import http.server, ssl, sys, os
+ROOT = "/var/www/singbox-sub"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body=b"", head_only=False):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _serve(self, head_only=False):
+        try:
+            name = open(os.path.join(ROOT, ".path_cache")).read().strip()
+            ok = bool(name) and self.path.split("?")[0] == "/" + name
+            body = open(os.path.join(ROOT, name), "rb").read() if ok else b""
+        except OSError:
+            ok, body = False, b""
+        if ok:
+            self._send(200, body, head_only)
+        else:
+            self._send(404, b"", head_only)
+
+    def do_GET(self):  self._serve()
+    def do_HEAD(self): self._serve(True)
+    def log_message(self, *a): pass
+
+port = int(sys.argv[1])
+httpd = http.server.HTTPServer(("0.0.0.0", port), Handler)
+if len(sys.argv) >= 4:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=sys.argv[2], keyfile=sys.argv[3])
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PYEOF2
+}
+
 manage_subscription() {
     while true; do
         clear
@@ -2078,18 +2207,8 @@ manage_subscription() {
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
                     echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
-                    cat > /var/www/singbox-sub/https_server.py <<EOF
-import http.server, ssl
-server_address = ('0.0.0.0', $SUB_PORT)
-httpd = http.server.HTTPServer(server_address, http.server.SimpleHTTPRequestHandler)
-protocol = ssl.PROTOCOL_TLS_SERVER if hasattr(ssl, 'PROTOCOL_TLS_SERVER') else ssl.PROTOCOL_TLS
-context = ssl.SSLContext(protocol)
-context.load_cert_chain(certfile="$CERT_PATH", keyfile="$KEY_PATH")
-httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-print(f"HTTPS Subscription server running on port {$SUB_PORT}...")
-httpd.serve_forever()
-EOF
-                    EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/https_server.py"
+                    write_sub_server
+                    EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/sub_server.py $SUB_PORT $CERT_PATH $KEY_PATH"
                     SUB_URL="https://$sub_domain:$SUB_PORT/$SUB_PATH"
                 else
                     LAST_PORT=${LAST_PORT:-8080}
@@ -2097,7 +2216,8 @@ EOF
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
                     echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
-                    EXEC_CMD="/usr/bin/python3 -m http.server $SUB_PORT"
+                    write_sub_server
+                    EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/sub_server.py $SUB_PORT"
                     SUB_URL="http://$(get_ip):$SUB_PORT/$SUB_PATH"
                 fi
 
@@ -2300,7 +2420,7 @@ enable_bbr() {
 while true; do
     clear
     echo -e "==============================================="
-    echo -e "          ${GREEN}Sing-box 综合管理脚本  v2.4${PLAIN}"
+    echo -e "          ${GREEN}Sing-box 综合管理脚本  v2.7${PLAIN}"
     echo -e "==============================================="
     show_status
     echo -e "-----------------------------------------------"
@@ -2346,6 +2466,14 @@ while true; do
             if [[ "$confirm" =~ ^[yY]$ ]]; then
                 systemctl stop sing-box 2>/dev/null
                 systemctl disable sing-box 2>/dev/null
+                # [v2.6] 官方仓库安装的包一并卸载，并移除仓库配置
+                if command -v dpkg &>/dev/null && dpkg -s sing-box &>/dev/null; then
+                    apt-get purge -y sing-box
+                    rm -f /etc/apt/sources.list.d/sagernet.sources /etc/apt/keyrings/sagernet.asc
+                elif command -v rpm &>/dev/null && rpm -q sing-box &>/dev/null; then
+                    dnf remove -y sing-box 2>/dev/null || yum remove -y sing-box
+                    rm -f /etc/yum.repos.d/sing-box.repo
+                fi
                 rm -f /etc/systemd/system/sing-box.service
                 systemctl daemon-reload
                 rm -f /usr/local/bin/ssb /usr/local/bin/sing-box
