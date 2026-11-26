@@ -307,25 +307,210 @@ nginx_reload() {
 nginx_restart() { require_root; systemctl restart nginx && success "Nginx 已重启"; }
 nginx_status()  { systemctl status nginx; }
 
+# ──────────────────────────────────────────────────────────
+# Nginx 更新（发行版软件源）
+# 说明：发行版会把安全修复回移（backport）到旧版本里，nginx -v 显示的上游版本号
+#       可能完全不变，因此这里一律比较"软件包版本"，并在升级后检查运行中的进程
+#       是否真的换成了新二进制，而不是比较 nginx -v 的字符串。
+# ──────────────────────────────────────────────────────────
+_NGX_PKG_CUR=""            # 已安装的包版本
+_NGX_PKG_NEW=""            # 源里的候选包版本
+_NGX_UPD_SECURITY=false    # 候选更新是否来自安全源 / 被标记为安全更新
+
+_nginx_pkg_installed_ver() {
+    case $(detect_pkg_manager) in
+        apt)
+            dpkg-query -W -f='${Version}' nginx 2>/dev/null || true ;;
+        dnf|yum)
+            # rpm -q 对未安装的包会把提示打到 stdout，先判断再取值
+            if rpm -q nginx &>/dev/null; then
+                rpm -q --qf '%{VERSION}-%{RELEASE}' nginx 2>/dev/null || true
+            fi ;;
+        pacman)
+            pacman -Q nginx 2>/dev/null | awk '{print $2}' || true ;;
+    esac
+}
+
+# 返回 0 = 有可用更新（结果写入 _NGX_PKG_NEW / _NGX_UPD_SECURITY）；1 = 已是最新
+_nginx_check_update() {
+    local mgr; mgr=$(detect_pkg_manager)
+    _NGX_PKG_CUR=$(_nginx_pkg_installed_ver)
+    _NGX_PKG_NEW=""
+    _NGX_UPD_SECURITY=false
+    [[ -n "$_NGX_PKG_CUR" ]] || die "未能通过包管理器查到 nginx 包版本（可能是源码编译安装），本功能仅支持发行版软件包"
+
+    case $mgr in
+        apt)
+            apt-get update -qq || warn "apt-get update 失败，将基于本地缓存判断"
+            local cand
+            cand=$(apt-cache policy nginx 2>/dev/null | awk '/Candidate:/ {print $2}')
+            if [[ -z "$cand" || "$cand" == "(none)" ]]; then return 1; fi
+            if dpkg --compare-versions "$cand" gt "$_NGX_PKG_CUR"; then
+                _NGX_PKG_NEW="$cand"
+                # 候选版本对应的来源行里是否带 security
+                if apt-cache policy nginx 2>/dev/null | awk -v c="$cand" '
+                    ($1==c || ($1=="***" && $2==c)) {f=1; next}
+                    f && /http|\/var\/lib\/dpkg/ { if ($0 ~ /security/) s=1; next }
+                    f { f=0 }
+                    END { exit !s }'; then
+                    _NGX_UPD_SECURITY=true
+                fi
+                return 0
+            fi
+            return 1 ;;
+        dnf|yum)
+            local out rc=0 src=0
+            out=$($mgr -q check-update nginx 2>/dev/null) || rc=$?
+            if [[ $rc -eq 1 ]]; then die "${mgr} check-update 执行失败，请检查软件源配置"; fi
+            if [[ $rc -eq 100 ]]; then
+                _NGX_PKG_NEW=$(awk '$1 ~ /^nginx([.]|$)/ {print $2; exit}' <<<"$out")
+                $mgr -q --security check-update nginx &>/dev/null || src=$?
+                if [[ $src -eq 100 ]]; then _NGX_UPD_SECURITY=true; fi
+                return 0
+            fi
+            return 1 ;;
+        pacman)
+            # Arch 不支持只升级单个包（-Sy 后单独装会造成部分升级），只做检查
+            command -v checkupdates &>/dev/null \
+                || die "Arch 无法安全地只检查/升级单个包。请手动执行: pacman -Syu（或安装 pacman-contrib 以使用 checkupdates）"
+            local newv
+            newv=$(checkupdates 2>/dev/null | awk '$1=="nginx" {print $4}') || true
+            if [[ -n "$newv" ]]; then _NGX_PKG_NEW="$newv"; return 0; fi
+            return 1 ;;
+    esac
+}
+
+# 列出候选版本相对当前版本涉及的 CVE（尽力而为，取不到时只提示，不影响升级）
+_nginx_show_update_cves() {
+    local mgr; mgr=$(detect_pkg_manager)
+    local cves=""
+    case $mgr in
+        apt)
+            local cl
+            cl=$(apt-get changelog nginx 2>/dev/null) || cl=""
+            if [[ -n "$cl" ]] && grep -qF "nginx (${_NGX_PKG_CUR})" <<<"$cl"; then
+                # 只取"当前已装版本"之后（更新）的 changelog 条目，避免把历史 CVE 都列出来
+                cves=$(awk -v m="nginx (${_NGX_PKG_CUR})" 'index($0,m)==1 {exit} {print}' <<<"$cl" \
+                       | grep -oE 'CVE-[0-9]{4}-[0-9]+' | sort -u | tr '\n' ' ') || true
+            else
+                warn "无法取得 changelog，或其中没有当前版本条目，不能按版本区间列出 CVE（可手动执行: apt-get changelog nginx）"
+                return 0
+            fi ;;
+        dnf|yum)
+            cves=$($mgr -q updateinfo info --security nginx 2>/dev/null \
+                   | grep -oE 'CVE-[0-9]{4}-[0-9]+' | sort -u | tr '\n' ' ') || true ;;
+        *) return 0 ;;
+    esac
+    if [[ -n "${cves// /}" ]]; then
+        info "该更新涉及的 CVE: ${cves}"
+    else
+        info "changelog / 安全公告中未发现 CVE 编号（可能是普通版本更新或 bug 修复）"
+    fi
+}
+
+# 运行中的 master 进程是否还在用已被替换（deleted）的旧二进制
+# 返回 0 = 是（补丁未生效）；1 = 否或 Nginx 未运行
+_nginx_running_binary_stale() {
+    local pid
+    pid=$(systemctl show -p MainPID --value nginx 2>/dev/null) || return 1
+    [[ -n "$pid" && "$pid" != "0" && -e "/proc/${pid}/exe" ]] || return 1
+    [[ "$(readlink "/proc/${pid}/exe" 2>/dev/null)" == *"(deleted)" ]]
+}
+
+# 若运行中的进程仍是旧二进制，则（按需确认后）重启使其生效；$1=true 时先询问
+_nginx_activate_if_stale() {
+    local ask="${1:-false}" assume_yes="${2:-false}"
+    _nginx_running_binary_stale || return 0
+    warn "运行中的 Nginx 进程仍在使用旧二进制，更新尚未生效"
+    nginx -t 2>&1 >&2 || die "配置检查失败，未重启。修复后请执行: $0 nginx restart"
+    if [[ "$ask" == "true" && "$assume_yes" != "true" ]]; then
+        if ! confirm "现在重启 Nginx 使其生效？（会短暂中断连接）"; then
+            warn "已跳过重启，补丁暂未生效；稍后请执行: $0 nginx restart"
+            return 0
+        fi
+    fi
+    systemctl restart nginx
+    success "Nginx 已重启"
+}
+
+# 用法: nginx_update [--check|-c] [--yes|-y]
+#   --check  只检查并显示更新/CVE 信息，不做任何修改
+#   --yes    跳过确认（适合脚本/定时任务）
 nginx_update() {
     require_root
     command -v nginx &>/dev/null || die "未检测到 Nginx，请先执行: $0 nginx install"
-    local old_ver; old_ver=$(nginx -v 2>&1)
-    info "当前版本: ${old_ver}"
-    info "正在检查更新..."
+
+    local check_only=false assume_yes=false arg
+    for arg in "$@"; do
+        case $arg in
+            --check|-c) check_only=true ;;
+            --yes|-y)   assume_yes=true ;;
+            *) die "未知参数: ${arg}（可用: --check 仅检查 / --yes 跳过确认）" ;;
+        esac
+    done
+
     local mgr; mgr=$(detect_pkg_manager)
-    case $mgr in
-        apt)     apt-get update -qq && apt-get install --only-upgrade -y nginx ;;
-        dnf|yum) $mgr update -y nginx ;;
-        pacman)  pacman -Sy --noconfirm nginx ;;
-    esac
-    nginx -t 2>&1 >&2 || die "更新后配置检查失败，请检查兼容性后再重启"
-    systemctl restart nginx
-    local new_ver; new_ver=$(nginx -v 2>&1)
-    if [[ "$old_ver" == "$new_ver" ]]; then
-        success "Nginx 已是最新版本: ${new_ver}"
+    info "当前运行版本: $(nginx -v 2>&1)"
+    info "正在检查更新（来源: 系统软件源）..."
+
+    if ! _nginx_check_update; then
+        success "Nginx 软件包已是源中的最新版本: ${_NGX_PKG_CUR}"
+        info "说明：发行版的安全修复通常体现在包修订号里，nginx -v 的上游版本号不变是正常的"
+        if _nginx_running_binary_stale; then
+            if $check_only; then
+                warn "运行中的进程仍在使用旧二进制（包已更新但进程未重启），补丁尚未生效；可执行: $0 nginx restart"
+            else
+                _nginx_activate_if_stale true "$assume_yes"
+            fi
+        fi
+        return 0
+    fi
+
+    echo ""
+    info "发现更新: 包版本 ${_NGX_PKG_CUR} → ${_NGX_PKG_NEW}"
+    if $_NGX_UPD_SECURITY; then
+        warn "该更新来自安全源 / 被标记为安全更新，建议尽快升级"
     else
-        success "Nginx 已更新: ${old_ver} → ${new_ver}"
+        info "更新来源未标记为安全更新（可参考下方 CVE 信息判断）"
+    fi
+    _nginx_show_update_cves
+
+    if $check_only; then
+        info "仅检查模式，未做任何修改。升级请执行: $0 nginx update"
+        return 0
+    fi
+    if [[ $mgr == pacman ]]; then
+        warn "Arch 不建议只升级单个包，请手动执行: pacman -Syu"
+        return 0
+    fi
+    if ! $assume_yes && ! confirm "确认升级 Nginx？（升级前会自动备份配置）"; then
+        info "已取消"
+        return 0
+    fi
+
+    config_backup
+    info "正在升级..."
+    case $mgr in
+        apt)
+            # force-confold：遇到被本脚本修改过的配置文件时保留现有版本，不弹交互提示、不覆盖
+            DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y \
+                -o Dpkg::Options::=--force-confold nginx ;;
+        dnf|yum) $mgr update -y nginx ;;
+    esac
+
+    local new_pkg; new_pkg=$(_nginx_pkg_installed_ver)
+    nginx -t 2>&1 >&2 || die "升级后配置检查失败，未重启。可执行 '$0 backup restore' 从升级前备份还原（备份目录: ${BACKUP_DIR}）"
+    success "Nginx 软件包已更新: ${_NGX_PKG_CUR} → ${new_pkg}"
+
+    # 只有运行中的进程确实还是旧二进制时才重启，不再无条件 restart
+    _nginx_activate_if_stale false "$assume_yes"
+    info "当前运行版本: $(nginx -v 2>&1)"
+    if ! systemctl is-active --quiet nginx; then
+        warn "Nginx 当前未运行，请执行: $0 nginx restart"
+    elif _nginx_running_binary_stale; then
+        warn "进程仍在使用旧二进制，更新尚未生效，请执行: $0 nginx restart"
+    else
+        success "运行中的进程已使用新二进制，更新已生效"
     fi
 }
 
@@ -3219,7 +3404,7 @@ ${BOLD}配置备份:${NC}
  
 ${BOLD}Nginx 控制:${NC}
   nginx install           安装 Nginx（自动检测包管理器）
-  nginx update            检查并更新 Nginx 到最新版本（自动重启生效）
+  nginx update [--check|-y] 检查更新(含安全更新/CVE提示)，确认后升级并备份配置；--check 仅检查，-y 跳过确认
   nginx reload            检查语法并重载配置
   nginx restart           重启 Nginx
   nginx status            查看运行状态
@@ -3419,7 +3604,7 @@ main() {
         nginx)
             case "${sub}" in
                 install)     check_and_install_nginx ;;
-                update)      nginx_update ;;
+                update)      nginx_update "$@" ;;
                 reload)      nginx_reload ;;
                 restart)     nginx_restart ;;
                 status)      nginx_status ;;
