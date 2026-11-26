@@ -5,18 +5,18 @@
 # 用法:
 #   ./pg-redis-shared.sh                            # 交互菜单
 #   ./pg-redis-shared.sh deploy  [DIR] [WG_IP] [db|redis|all]
-#   ./pg-redis-shared.sh update  [DIR] [db|redis|all]
+#   ./pg-redis-shared.sh update  [DIR] [db|redis|all] [--backup] [--encrypt]  # --backup: 拉取镜像前先做全量备份（失败则中止更新）；--encrypt: 备份加密
 #   ./pg-redis-shared.sh add-db  [DIR] <DB> <USER> [PW]
 #   ./pg-redis-shared.sh del-db  [DIR] <DB> <USER>
 #   ./pg-redis-shared.sh clear-db [DIR] <DB>
 #   ./pg-redis-shared.sh list-db [DIR]
 #   ./pg-redis-shared.sh passwd  [DIR] <USER> [NEW_PW]
-#   ./pg-redis-shared.sh backup  [DIR] [DEST] [--rsync] [--alist] [--encrypt]  # 全量备份（.env+配置+pg_dumpall+Redis数据 → 单个 tar.gz，--encrypt 额外加密）
-#   ./pg-redis-shared.sh restore [DIR] <备份tar.gz[.enc]|rsync://user@host[:port]/path/file|alist:///path/file> [解密密钥]  # 全量恢复
+#   ./pg-redis-shared.sh backup  [DIR] [DEST] [--webdav] [--encrypt]  # 全量备份（.env+配置+pg_dumpall+Redis数据 → 单个 tar.gz；--webdav 同时上传远端，--encrypt 额外加密；成功后本地只保留最近 LOCAL_BACKUP_KEEP 份，默认 3，0=不清理）
+#   ./pg-redis-shared.sh restore [DIR] <备份tar.gz[.enc]|webdav://文件名> [解密密钥]  # 全量恢复（webdav://文件名 = WEBDAV_REMOTE_DIR 下的文件；含 / 则视为相对 WEBDAV_URL 的路径）
 #   ./pg-redis-shared.sh tune-db    [DIR]               # 查看/调整 PostgreSQL 性能参数
 #   ./pg-redis-shared.sh tune-redis [DIR]               # 查看/调整 Redis 性能参数
-#   ./pg-redis-shared.sh rsync-config [DIR]             # 配置/查看远端 rsync 参数
-#   ./pg-redis-shared.sh alist-config [DIR]             # 配置/测试 AList 连接
+#   ./pg-redis-shared.sh webdav-config [DIR]            # 配置/测试 WebDAV 远端（WEBDAV_URL/USER/PASSWORD/REMOTE_DIR）
+#   ./pg-redis-shared.sh webdav-list [DIR]              # 列出 WebDAV 远端上的备份文件
 #   ./pg-redis-shared.sh status  [DIR]
 #   ./pg-redis-shared.sh start   [DIR] [db|redis]
 #   ./pg-redis-shared.sh stop    [DIR] [db|redis]
@@ -110,7 +110,7 @@ _check_pw() {
 load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
-    local _ALLOWED_KEYS='WG_IP|POSTGRES_PASSWORD|POSTGRES_DATABASE|POSTGRES_APP_USER|POSTGRES_APP_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|POSTGRES_IMAGE|REDIS_IMAGE|BACKUP_ENC_KEY|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR|ALIST_MODE|ALIST_MOUNT|ALIST_URL|ALIST_TOKEN|ALIST_REMOTE_DIR|POSTGRES_SHARED_BUFFERS|POSTGRES_EFFECTIVE_CACHE|POSTGRES_MAINTENANCE_WORK_MEM|POSTGRES_WORK_MEM|POSTGRES_MAX_CONNECTIONS|POSTGRES_WAL_BUFFERS|REDIS_MAXMEMORY'
+    local _ALLOWED_KEYS='WG_IP|POSTGRES_PASSWORD|POSTGRES_DATABASE|POSTGRES_APP_USER|POSTGRES_APP_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|POSTGRES_IMAGE|REDIS_IMAGE|BACKUP_ENC_KEY|WEBDAV_URL|WEBDAV_USER|WEBDAV_PASSWORD|WEBDAV_REMOTE_DIR|WEBDAV_KEEP|LOCAL_BACKUP_KEEP|POSTGRES_SHARED_BUFFERS|POSTGRES_EFFECTIVE_CACHE|POSTGRES_MAINTENANCE_WORK_MEM|POSTGRES_WORK_MEM|POSTGRES_MAX_CONNECTIONS|POSTGRES_WAL_BUFFERS|REDIS_MAXMEMORY'
     local key val line
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -130,8 +130,8 @@ _env_set() {   # DIR KEY VAL
     local envfile="$1/.env" key="$2" val="$3" tmp
     tmp="${envfile}.tmp.$$"
     if grep -q "^${key}=" "$envfile" 2>/dev/null; then
-        awk -v k="$key" -v v="$val" '
-            BEGIN { replaced=0 }
+        _ENVSET_V="$val" awk -v k="$key" '
+            BEGIN { replaced=0; v=ENVIRON["_ENVSET_V"] }
             /^[[:space:]]*#/ { print; next }
             $0 ~ "^" k "=" { print k "=" v; replaced=1; next }
             { print }
@@ -155,19 +155,23 @@ _svc_exists() {   # DIR SVC
     grep -q "^  $2:" "$1/docker-compose.yml" 2>/dev/null
 }
 
-# 实际 Docker 网段 CIDR（用于 pg_hba.conf），优先 compose 项目网络
+# Docker 网段 CIDR（用于 pg_hba.conf）。
+#
+# 之前这里探测的是本机（pg-infra 所在机器）自己的 docker 网络子网，但真正
+# 需要放行的是各个 app 节点自己机器上的 docker bridge 网段——那些节点的
+# docker build/compose 会各自随机分配子网（默认在 172.17.0.0/16 ~
+# 172.31.0.0/16 之间跳），跟 pg-infra 本机的网络毫无关系，探测本机网段
+# 对远程节点没有任何意义，之前也确实因为这个多次踩坑（子网对不上、
+# Docker 重启后又漂移）。
+#
+# 直接放行 Docker 默认分配池覆盖的整个 172.16.0.0/12（即 172.16.0.0 ~
+# 172.31.255.255），不用再逐个节点探测/登记具体子网。这个范围本来就是
+# IANA 保留的私有地址段，只要 WireGuard mesh 本身没把外部流量放进来，
+# 放宽这段不会引入额外的公网风险。
 _docker_subnet_cidr() {
-    local s
-    s=$(docker network inspect pg-infra_default \
-        --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
-    [[ -z "$s" ]] && s=$(docker network inspect infra_default \
-        --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
-    if [[ -z "$s" ]]; then
-        s=$(docker network inspect bridge \
-            --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
-    fi
-    echo "${s:-172.17.0.0/16}"
+    echo "172.16.0.0/12"
 }
+
 
 # WireGuard 网段 CIDR，假定 /24（与 MariaDB 版本 'IP%' 的假设一致）
 _wg_subnet_cidr() {
@@ -482,7 +486,16 @@ EOF
 
 cmd_update() {
     [[ $EUID -eq 0 ]] || error "需要 root 权限"
-    local dir="${1:-$DEFAULT_DIR}" target="${2:-all}"
+    local do_backup=0 do_encrypt=0 _pos=() _a
+    for _a in "$@"; do
+        case "$_a" in
+            --backup)  do_backup=1 ;;
+            --encrypt) do_encrypt=1 ;;
+            *) _pos+=("$_a") ;;
+        esac
+    done
+    (( do_encrypt && ! do_backup )) && warn "--encrypt 仅在配合 --backup 时生效，本次忽略"
+    local dir="${_pos[0]:-$DEFAULT_DIR}" target="${_pos[1]:-all}"
     load_env "$dir"
 
     local svcs=()
@@ -496,6 +509,16 @@ cmd_update() {
             ;;
         *) error "target 须为 db / redis / all" ;;
     esac
+
+    if (( do_backup )); then
+        header "更新前全量备份"
+        # 备份失败会直接中止（cmd_backup 内部 error → exit），此时尚未拉取/重建任何镜像
+        if (( do_encrypt )); then
+            cmd_backup "$dir" "${dir}/backup" --encrypt
+        else
+            cmd_backup "$dir" "${dir}/backup"
+        fi
+    fi
 
     header "拉取最新镜像: ${svcs[*]}"
     compose_run "$dir" pull "${svcs[@]}"
@@ -791,353 +814,242 @@ cmd_tune_redis() {
 }
 
 # ════════════════════════════════════════════════════════════
-# rsync 远端传输（通用文件传输，与数据库引擎无关）
+# WebDAV 远程备份（通用：Nextcloud / ownCloud / AList / 群晖 / 坚果云 / rclone serve webdav 等）
+# 仅依赖 curl。配置项（.env 或同名环境变量）：
+#   WEBDAV_URL         服务端 WebDAV 根地址，如 https://dav.example.com/remote.php/dav/files/me
+#   WEBDAV_USER / WEBDAV_PASSWORD
+#   WEBDAV_REMOTE_DIR  备份目录（相对 WEBDAV_URL），默认 /pg-infra-backup
+#   WEBDAV_KEEP        上传成功后远端只保留最近 N 份备份，默认 3；0 = 不清理
 # ════════════════════════════════════════════════════════════
-_check_rsync() {
-    command -v rsync >/dev/null 2>&1 || error "未找到 rsync，请先安装: apt-get install -y rsync"
-    command -v ssh   >/dev/null 2>&1 || error "未找到 ssh，请先安装 openssh-client"
-}
+_BK_NAME_RE='^pg-infra-full-backup_[0-9]{8}_[0-9]{6}\.tar\.gz(\.enc)?$'
+_WEBDAV_CFG=""
 
-_load_rsync_conf() {
-    local dir="$1"
-    load_env "$dir"
-    [[ -n "${RSYNC_REMOTE:-}"     ]] || error "未配置 RSYNC_REMOTE，请先运行 rsync-config"
-    [[ -n "${RSYNC_USER:-}"       ]] || error "未配置 RSYNC_USER，请先运行 rsync-config"
-    [[ -n "${RSYNC_REMOTE_DIR:-}" ]] || error "未配置 RSYNC_REMOTE_DIR，请先运行 rsync-config"
-    RSYNC_PORT="${RSYNC_PORT:-22}"
-    RSYNC_KEY="${RSYNC_KEY:-}"
-    RSYNC_KNOWN_HOSTS="${dir}/.rsync_known_hosts"
-    touch "$RSYNC_KNOWN_HOSTS" 2>/dev/null
-    chmod 600 "$RSYNC_KNOWN_HOSTS" 2>/dev/null || true
-}
+_check_webdav_deps() { command -v curl >/dev/null 2>&1 || error "未找到 curl，请先安装"; }
 
-_rsync_ssh_opts() {
-    local key="${RSYNC_KEY:-}" port="${RSYNC_PORT:-22}"
-    local khf="${RSYNC_KNOWN_HOSTS:-/dev/null}"
-    local ssh_cmd="ssh -p ${port} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${khf} -o BatchMode=yes"
-    [[ -n "$key" ]] && ssh_cmd+=" -i ${key}"
-    echo "$ssh_cmd"
-}
-
-_rsync_push() {   # DIR SRC_PATH [REMOTE_DEST_DIR]
-    local dir="$1" src="$2" remote_dest="${3:-}"
-    _check_rsync
-    _load_rsync_conf "$dir"
-    [[ -n "$remote_dest" ]] || remote_dest="$RSYNC_REMOTE_DIR"
-    remote_dest="${remote_dest%/}/"
-    local ssh_cmd; ssh_cmd=$(_rsync_ssh_opts)
-    info "rsync 推送: ${src} → ${RSYNC_USER}@${RSYNC_REMOTE}:${remote_dest}"
-    rsync -avz --progress -e "$ssh_cmd" "$src" "${RSYNC_USER}@${RSYNC_REMOTE}:${remote_dest}" \
-        && log "推送完成" || error "rsync 推送失败（退出码 $?）"
-}
-
-_rsync_list() {   # DIR [REMOTE_PATH]
-    local dir="$1" remote_path="${2:-}"
-    _check_rsync
-    _load_rsync_conf "$dir"
-    [[ -n "$remote_path" ]] || remote_path="$RSYNC_REMOTE_DIR"
-    local ssh_cmd; ssh_cmd=$(_rsync_ssh_opts)
-    $ssh_cmd "${RSYNC_USER}@${RSYNC_REMOTE}" \
-        "ls -lht '${remote_path}' 2>/dev/null || echo '（目录为空或不存在）'"
-}
-
-_parse_rsync_uri() {   # URI → RSYNC_URI_{USER,HOST,PORT,PATH}
-    local uri="$1"
-    if [[ "$uri" =~ ^rsync://([^@]+)@([^:/]+)(:([0-9]+))?(/.*)?$ ]]; then
-        RSYNC_URI_USER="${BASH_REMATCH[1]}"
-        RSYNC_URI_HOST="${BASH_REMATCH[2]}"
-        RSYNC_URI_PORT="${BASH_REMATCH[4]:-22}"
-        RSYNC_URI_PATH="${BASH_REMATCH[5]:-/}"
-    else
-        error "无法解析 rsync URI: '${uri}'  格式: rsync://user@host[:port]/path/file"
-    fi
-}
-
-cmd_rsync_config() {
-    local dir="${1:-$DEFAULT_DIR}"
-    [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
-    load_env "$dir"
-
-    header "当前 rsync 配置"
-    printf "  RSYNC_REMOTE     = %s\n" "${RSYNC_REMOTE:-（未设置）}"
-    printf "  RSYNC_USER       = %s\n" "${RSYNC_USER:-（未设置）}"
-    printf "  RSYNC_PORT       = %s\n" "${RSYNC_PORT:-22}"
-    printf "  RSYNC_KEY        = %s\n" "${RSYNC_KEY:-（使用默认密钥）}"
-    printf "  RSYNC_REMOTE_DIR = %s\n" "${RSYNC_REMOTE_DIR:-（未设置）}"
-    echo
-
-    read -rp "  是否修改配置？[y/N] " yn
-    [[ "${yn,,}" == "y" ]] || return 0
-
-    local val
-    read -rp "  远端主机 IP/域名 [${RSYNC_REMOTE:-}]: " val
-    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_REMOTE" "$val"
-    read -rp "  SSH 用户名 [${RSYNC_USER:-root}]: " val
-    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_USER" "$val" || \
-        { [[ -z "${RSYNC_USER:-}" ]] && _env_set "$dir" "RSYNC_USER" "root"; }
-    read -rp "  SSH 端口 [${RSYNC_PORT:-22}]: " val
-    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_PORT" "$val" || \
-        { [[ -z "${RSYNC_PORT:-}" ]] && _env_set "$dir" "RSYNC_PORT" "22"; }
-    read -rp "  SSH 私钥路径（留空使用默认）[${RSYNC_KEY:-}]: " val
-    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_KEY" "$val"
-    read -rp "  远端备份目录 [${RSYNC_REMOTE_DIR:-/backup/pg-infra}]: " val
-    if [[ -n "$val" ]]; then
-        _env_set "$dir" "RSYNC_REMOTE_DIR" "$val"
-    elif [[ -z "${RSYNC_REMOTE_DIR:-}" ]]; then
-        _env_set "$dir" "RSYNC_REMOTE_DIR" "/backup/pg-infra"
-    fi
-    log "rsync 配置已保存"
-
-    read -rp "  是否立即测试连通性？[y/N] " yn
-    if [[ "${yn,,}" == "y" ]]; then
-        load_env "$dir"
-        _rsync_list "$dir" || warn "连接测试失败，请检查配置"
-    fi
-}
-
-# ════════════════════════════════════════════════════════════
-# AList 网盘（通用文件传输）
-# ════════════════════════════════════════════════════════════
-_check_alist_deps() { command -v curl >/dev/null 2>&1 || error "未找到 curl，请先安装"; }
-
-_load_alist_conf() {
-    local dir="$1"
-    load_env "$dir"
-    ALIST_MODE="${ALIST_MODE:-mount}"
-    ALIST_REMOTE_DIR="${ALIST_REMOTE_DIR:-/backup/pg-infra}"
-    case "$ALIST_MODE" in
-        mount)
-            [[ -n "${ALIST_MOUNT:-}" ]] || error "mount 模式需要配置 ALIST_MOUNT（本地挂载点），请运行 alist-config"
-            ;;
-        webdav)
-            [[ -n "${ALIST_URL:-}"   ]] || error "webdav 模式需要配置 ALIST_URL，请运行 alist-config"
-            [[ -n "${ALIST_TOKEN:-}" ]] || error "webdav 模式需要配置 ALIST_TOKEN，请运行 alist-config"
-            ALIST_URL="${ALIST_URL%/}"
-            ;;
-        *) error "ALIST_MODE 只能为 mount 或 webdav，当前: '${ALIST_MODE}'" ;;
-    esac
-}
-
-_alist_check_mount() {
-    local mnt="$1"
-    [[ -d "$mnt" ]] || error "AList 挂载目录不存在: ${mnt}"
-    timeout 5 ls "$mnt" >/dev/null 2>&1 || error "AList 挂载点无响应: ${mnt}"
-}
-
-_alist_authfile() {
-    # 把 Authorization header 写进临时文件（0600，随进程退出自动清理），
-    # 交给 curl -K 读取，避免 token 以 -H 参数形式出现在 `ps` 里。
-    local f; f=$(mktemp); _register_tmp "$f"
-    chmod 600 "$f"
-    printf 'header = "Authorization: Basic %s"\n' "$(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" > "$f"
-    echo "$f"
-}
-
-_alist_mkdir_webdav() {
-    local path="$1"
-    local authfile; authfile=$(_alist_authfile)
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X MKCOL \
-        -K "$authfile" \
-        "${ALIST_URL}/dav${path}")
-    rm -f "$authfile"
-    [[ "$code" == "201" || "$code" == "405" || "$code" == "301" ]] \
-        || warn "创建目录 ${path} 返回 HTTP ${code}（可能已存在，继续）"
-}
-
-_alist_upload_webdav() {   # LOCAL_FILE REMOTE_PATH
-    local local_file="$1" remote_path="$2"
-    local fname; fname=$(basename "$local_file")
-    local url="${ALIST_URL}/dav${remote_path%/}/${fname}"
-    local authfile; authfile=$(_alist_authfile)
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-        -K "$authfile" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary "@${local_file}" "$url")
-    rm -f "$authfile"
-    [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]] \
-        || error "上传 ${fname} 失败，HTTP ${code}（URL: ${url}）"
-    log "✓ 上传: ${fname}  HTTP ${code}"
-}
-
-_alist_download_webdav() {   # REMOTE_FILE_PATH LOCAL_DIR
-    local remote_path="$1" local_dir="$2"
-    local fname; fname=$(basename "$remote_path")
-    local url="${ALIST_URL}/dav${remote_path}"
-    local out="${local_dir}/${fname}"
-    local authfile; authfile=$(_alist_authfile)
-    local code
-    code=$(curl -s -w "%{http_code}" -X GET \
-        -K "$authfile" \
-        -o "$out" "$url")
-    rm -f "$authfile"
-    [[ "$code" == "200" || "$code" == "206" ]] \
-        || { rm -f "$out"; error "下载 ${fname} 失败，HTTP ${code}"; }
-    log "✓ 下载: ${fname}  ($(du -sh "$out" | cut -f1))" >&2
-}
-
-_alist_list_webdav() {
-    local remote_path="${1:-$ALIST_REMOTE_DIR}"
-    local url="${ALIST_URL}/dav${remote_path}"
-    local authfile; authfile=$(_alist_authfile)
-    local body
-    body=$(curl -s -X PROPFIND \
-        -K "$authfile" \
-        -H "Depth: 1" -H "Content-Type: application/xml" \
-        --data '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlength/><D:getlastmodified/></D:prop></D:propfind>' \
-        "$url" 2>/dev/null) || { rm -f "$authfile"; warn "无法连接 AList WebDAV: ${url}" >&2; return 1; }
-    rm -f "$authfile"
-    echo "$body" | grep -oP '(?<=<D:href>)[^<]+' | grep -E '\.(sql|sql\.gz|tar\.gz)$' \
-        | sed 's|.*/dav||' | while read -r p; do printf "  %s\n" "$p"; done
-}
-
-_alist_push_file() {   # DIR LOCAL_FILE [REMOTE_SUBDIR]
-    local dir="$1" local_file="$2" remote_sub="${3:-}"
-    _load_alist_conf "$dir"; _check_alist_deps
-    [[ -f "$local_file" ]] || error "文件不存在: ${local_file}"
-    local remote_dir="${ALIST_REMOTE_DIR%/}${remote_sub:+/${remote_sub}}"
-    case "$ALIST_MODE" in
-    mount)
-        _alist_check_mount "$ALIST_MOUNT"
-        local dest_dir="${ALIST_MOUNT%/}/${remote_dir#/}"
-        mkdir -p "$dest_dir" 2>/dev/null || warn "无法在挂载点创建目录（某些只读网盘正常），继续尝试..."
-        header "AList 挂载上传: ${local_file} → ${dest_dir}"
-        cp "$local_file" "${dest_dir%/}/" \
-            && log "上传完成 → ${dest_dir%/}/$(basename "$local_file")" \
-            || error "复制到 AList 挂载目录失败"
-        ;;
-    webdav)
-        header "AList WebDAV 上传: ${local_file} → ${ALIST_URL}/dav${remote_dir}"
-        _alist_mkdir_webdav "$remote_dir"
-        _alist_upload_webdav "$local_file" "$remote_dir"
-        ;;
-    esac
-}
-
-_alist_fetch_file() {   # DIR REMOTE_FILE → 返回本地临时路径
-    local dir="$1" remote_file="$2"
-    _load_alist_conf "$dir"; _check_alist_deps
-    local tmp_dir; tmp_dir=$(mktemp -d); _register_tmp "$tmp_dir"
-    local fname; fname=$(basename "$remote_file")
-    case "$ALIST_MODE" in
-    mount)
-        _alist_check_mount "$ALIST_MOUNT"
-        local src="${ALIST_MOUNT%/}/${remote_file#/}"
-        [[ -f "$src" ]] || { rm -rf "$tmp_dir"; error "AList 挂载中找不到文件: ${src}"; }
-        cp "$src" "${tmp_dir}/${fname}" || { rm -rf "$tmp_dir"; error "从 AList 挂载复制文件失败"; }
-        ;;
-    webdav)
-        _alist_download_webdav "$remote_file" "$tmp_dir" \
-            || { rm -rf "$tmp_dir"; error "从 AList WebDAV 下载文件失败"; }
-        ;;
-    esac
-    echo "${tmp_dir}/${fname}"
-}
-
-_alist_list() {   # DIR [REMOTE_PATH]
-    local dir="$1" remote_path="${2:-}"
-    _load_alist_conf "$dir"
-    [[ -n "$remote_path" ]] || remote_path="$ALIST_REMOTE_DIR"
-    case "$ALIST_MODE" in
-    mount)
-        _alist_check_mount "$ALIST_MOUNT"
-        local src="${ALIST_MOUNT%/}/${remote_path#/}"
-        [[ -d "$src" ]] || { warn "目录不存在: ${src}"; return 0; }
-        ls -lht "$src" 2>/dev/null | grep -E '\.(sql|sql\.gz|tar\.gz)$' || warn "（目录为空或无备份文件）"
-        ;;
-    webdav)
-        _check_alist_deps
-        local files; files=$(_alist_list_webdav "$remote_path")
-        [[ -n "$files" ]] && echo "$files" || warn "（目录为空或无备份文件）"
-        ;;
-    esac
-}
-
-cmd_alist_config() {
-    local dir="${1:-$DEFAULT_DIR}"
-    [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
-    load_env "$dir"
-
-    header "当前 AList 配置"
-    printf "  ALIST_MODE       = %s\n" "${ALIST_MODE:-mount}"
-    printf "  ALIST_MOUNT      = %s\n" "${ALIST_MOUNT:-（未设置，mount 模式需要）}"
-    printf "  ALIST_URL        = %s\n" "${ALIST_URL:-（未设置，webdav 模式需要）}"
-    printf "  ALIST_TOKEN      = %s\n" "${ALIST_TOKEN:+***已设置***}${ALIST_TOKEN:-（未设置，webdav 模式需要）}"
-    printf "  ALIST_REMOTE_DIR = %s\n" "${ALIST_REMOTE_DIR:-/backup/pg-infra}"
-    echo
-
-    read -rp "  是否修改配置？[y/N] " yn
-    [[ "${yn,,}" == "y" ]] || return 0
-
-    echo "  AList 支持两种接入模式："
-    echo "  [1] mount  — AList 已挂载为本地 FUSE 目录（推荐，速度快）"
-    echo "  [2] webdav — 通过 AList WebDAV HTTP 接口传输（无需挂载）"
-    read -rp "  选择模式 [1=mount/2=webdav，当前: ${ALIST_MODE:-mount}]: " sel
-    case "$sel" in
-        1) _env_set "$dir" "ALIST_MODE" "mount"  ;;
-        2) _env_set "$dir" "ALIST_MODE" "webdav" ;;
-        "") : ;;
-        *) warn "无效选择，保持原值" ;;
-    esac
-    load_env "$dir"
-
-    local val
-    if [[ "${ALIST_MODE:-mount}" == "mount" ]]; then
-        read -rp "  本地挂载点路径 [${ALIST_MOUNT:-/mnt/alist}]: " val
-        if [[ -n "$val" ]]; then _env_set "$dir" "ALIST_MOUNT" "$val"
-        elif [[ -z "${ALIST_MOUNT:-}" ]]; then _env_set "$dir" "ALIST_MOUNT" "/mnt/alist"; fi
-    else
-        read -rp "  AList 服务地址（含端口，如 http://127.0.0.1:5244）[${ALIST_URL:-}]: " val
-        [[ -n "$val" ]] && _env_set "$dir" "ALIST_URL" "${val%/}"
-        read -rsp "  AList Token / 密码（输入不回显）: " val; echo
-        [[ -n "$val" ]] && _env_set "$dir" "ALIST_TOKEN" "$val"
-    fi
-
-    read -rp "  AList 内备份目录 [${ALIST_REMOTE_DIR:-/backup/pg-infra}]: " val
-    if [[ -n "$val" ]]; then _env_set "$dir" "ALIST_REMOTE_DIR" "$val"
-    elif [[ -z "${ALIST_REMOTE_DIR:-}" ]]; then _env_set "$dir" "ALIST_REMOTE_DIR" "/backup/pg-infra"; fi
-
-    log "AList 配置已保存"
-    load_env "$dir"
-
-    read -rp "  是否立即测试连通性？[y/N] " yn
-    if [[ "${yn,,}" == "y" ]]; then
-        _load_alist_conf "$dir"
-        case "$ALIST_MODE" in
-        mount)
-            if timeout 5 ls "$ALIST_MOUNT" >/dev/null 2>&1; then
-                log "✓ 挂载点响应正常: ${ALIST_MOUNT}"; ls -lh "$ALIST_MOUNT" 2>/dev/null | head -5 || true
-            else warn "✗ 挂载点无响应: ${ALIST_MOUNT}"; fi
-            ;;
-        webdav)
-            _check_alist_deps
-            local code authfile; authfile=$(_alist_authfile)
-            code=$(curl -s -o /dev/null -w "%{http_code}" -X PROPFIND \
-                -K "$authfile" \
-                -H "Depth: 0" --connect-timeout 8 "${ALIST_URL}/dav/")
-            rm -f "$authfile"
-            if [[ "$code" == "207" || "$code" == "200" ]]; then
-                log "✓ AList WebDAV 连接正常（HTTP ${code}）"
-            else
-                warn "✗ AList WebDAV 连接失败（HTTP ${code}）  URL: ${ALIST_URL}/dav/"
-            fi
-            ;;
+_urlencode_path() {   # 逐字节百分号编码，保留 / 与 unreserved 字符
+    local LC_ALL=C s="$1" out="" c i
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [A-Za-z0-9._~/-]) out+="$c" ;;
+            *) out+=$(printf '%%%02X' "'$c") ;;
         esac
+    done
+    printf '%s' "$out"
+}
+
+_urldecode() { printf '%b' "${1//%/\\x}"; }
+
+# 加载并校验配置；.env 不存在时（如全新机器恢复）可直接用环境变量
+_load_webdav_conf() {   # DIR
+    local dir="$1"
+    if [[ -f "$dir/.env" ]]; then load_env "$dir"; fi
+    [[ -n "${WEBDAV_URL:-}"      ]] || error "未配置 WEBDAV_URL，请先运行 webdav-config（全新机器可用环境变量传入 WEBDAV_URL/WEBDAV_USER/WEBDAV_PASSWORD）"
+    [[ -n "${WEBDAV_USER:-}"     ]] || error "未配置 WEBDAV_USER，请先运行 webdav-config"
+    [[ -n "${WEBDAV_PASSWORD:-}" ]] || error "未配置 WEBDAV_PASSWORD，请先运行 webdav-config"
+    WEBDAV_URL="${WEBDAV_URL%/}"
+    local rd="${WEBDAV_REMOTE_DIR:-pg-infra-backup}"
+    while [[ "$rd" == *//* ]]; do rd="${rd//\/\//\/}"; done   # 合并重复的 /
+    while [[ "$rd" == /* ]]; do rd="${rd#/}"; done
+    rd="${rd%/}"; [[ -n "$rd" ]] || rd="pg-infra-backup"
+    WEBDAV_REMOTE_DIR="/${rd}"
+    [[ "$WEBDAV_URL" == https://* ]] || warn "WEBDAV_URL 不是 https：凭据和备份内容将以明文在网络上传输"
+    # 凭据写入 0600 临时 curl 配置，避免出现在 ps 参数里；退出时自动清理
+    _WEBDAV_CFG=$(mktemp); _register_tmp "$_WEBDAV_CFG"; chmod 600 "$_WEBDAV_CFG"
+    local u="${WEBDAV_USER}:${WEBDAV_PASSWORD}"
+    u="${u//\\/\\\\}"; u="${u//\"/\\\"}"
+    printf 'user = "%s"\n' "$u" > "$_WEBDAV_CFG"
+}
+
+_webdav_curl() { curl -sS -K "$_WEBDAV_CFG" --connect-timeout 15 "$@"; }
+
+_webdav_mkcol_p() {   # REMOTE_DIR — 逐级创建（MKCOL 不会自动建父目录）
+    local path="$1" cur="" seg code
+    local -a segs
+    IFS=/ read -ra segs <<< "${path#/}"
+    for seg in "${segs[@]}"; do
+        [[ -n "$seg" ]] || continue
+        cur+="/${seg}"
+        code=$(_webdav_curl -o /dev/null -w '%{http_code}' -X MKCOL \
+            "${WEBDAV_URL}$(_urlencode_path "$cur")/") || code="000"
+        case "$code" in
+            201|200|301|302|405) : ;;                       # 新建成功 / 已存在
+            401) error "WebDAV 认证失败（HTTP 401），请检查用户名/密码" ;;
+            000) error "无法连接 WebDAV: ${WEBDAV_URL}" ;;
+            *)   warn "创建目录 ${cur} 返回 HTTP ${code}（可能已存在，继续）" ;;
+        esac
+    done
+}
+
+_webdav_put() {   # LOCAL_FILE REMOTE_DIR
+    local f="$1" rdir="$2" name url code lsize rsize
+    name=$(basename "$f")
+    url="${WEBDAV_URL}$(_urlencode_path "${rdir}/${name}")"
+    lsize=$(stat -c%s "$f")
+    info "上传 ${name}（$(du -sh "$f" | cut -f1)）→ ${WEBDAV_URL}${rdir}/"
+    code=$(_webdav_curl -o /dev/null -w '%{http_code}' -T "$f" "$url") || code="000"
+    case "$code" in
+        200|201|204) : ;;
+        *) error "上传失败，HTTP ${code}（URL: ${url}）" ;;
+    esac
+    rsize=$(_webdav_curl -I "$url" 2>/dev/null | tr -d '\r' \
+        | awk 'tolower($1)=="content-length:"{print $2}' | tail -n1) || rsize=""
+    if [[ -z "$rsize" ]]; then
+        warn "服务器未返回 Content-Length，跳过上传后大小校验"
+    elif [[ "$rsize" != "$lsize" ]]; then
+        error "远端文件大小(${rsize})与本地(${lsize})不一致，上传可能不完整: ${url}"
+    fi
+    log "✓ 已上传并校验: ${rdir}/${name}"
+}
+
+_webdav_get() {   # REMOTE_PATH（相对 WEBDAV_URL） LOCAL_DIR
+    local rpath="$1" ldir="$2" name out url code
+    name=$(basename "$rpath"); out="${ldir}/${name}"
+    url="${WEBDAV_URL}$(_urlencode_path "$rpath")"
+    info "下载 ${rpath} ..."
+    code=$(_webdav_curl -o "$out" -w '%{http_code}' "$url") || code="000"
+    [[ "$code" == "200" ]] || { rm -f "$out"; error "下载失败，HTTP ${code}（URL: ${url}）"; }
+    log "✓ 下载完成: ${name}（$(du -sh "$out" | cut -f1)）"
+}
+
+# 远端只保留最近 KEEP 份（仅处理符合备份命名的文件；列表失败/新文件不在列表中时一律不删）
+_webdav_prune() {   # REMOTE_DIR KEEP JUST_UPLOADED_NAME
+    local rdir="$1" keep="$2" just="$3" files n=0 f code
+    [[ "$keep" =~ ^[0-9]+$ ]] || { warn "WEBDAV_KEEP='${keep}' 不是数字，跳过远端清理"; return 0; }
+    (( keep > 0 )) || return 0
+    files=$(_webdav_list "$rdir") || { warn "无法列出远端文件，跳过清理"; return 0; }
+    grep -qxF -- "$just" <<< "$files" \
+        || { warn "远端列表中未找到刚上传的文件，为安全起见跳过清理"; return 0; }
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        n=$((n + 1))
+        (( n > keep )) || continue
+        [[ "$f" != "$just" ]] || continue
+        code=$(_webdav_curl -o /dev/null -w '%{http_code}' -X DELETE \
+            "${WEBDAV_URL}$(_urlencode_path "${rdir}/${f}")") || code="000"
+        case "$code" in
+            200|202|204|404) log "已清理旧备份: ${f}" ;;
+            *) warn "清理 ${f} 失败（HTTP ${code}），已保留" ;;
+        esac
+    done <<< "$files"
+    return 0
+}
+
+# 列出远端备份文件名（新→旧），每行一个；需先 _load_webdav_conf
+_webdav_list() {   # [REMOTE_DIR]
+    local rdir="${1:-$WEBDAV_REMOTE_DIR}" url resp code body h n
+    url="${WEBDAV_URL}$(_urlencode_path "$rdir")/"
+    resp=$(_webdav_curl -X PROPFIND -H "Depth: 1" -H "Content-Type: application/xml" \
+        --data '<?xml version="1.0"?><propfind xmlns="DAV:"><prop><getcontentlength/></prop></propfind>' \
+        -w $'\n%{http_code}' "$url") || { warn "无法连接 WebDAV: ${url}"; return 1; }
+    code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+    case "$code" in
+        207) : ;;
+        404) warn "远端目录不存在: ${rdir}（首次备份时会自动创建）"; return 0 ;;
+        401|403) warn "WebDAV 认证失败或无权限（HTTP ${code}）"; return 1 ;;
+        *)   warn "WebDAV 列目录失败（HTTP ${code}）"; return 1 ;;
+    esac
+    printf '%s' "$body" | { grep -oiE '<([a-z0-9]+:)?href>[^<]+' || true; } | sed -E 's/^<[^>]*>//' \
+        | while IFS= read -r h; do
+            h="${h%/}"; n=$(_urldecode "${h##*/}")
+            if [[ "$n" =~ $_BK_NAME_RE ]]; then printf '%s\n' "$n"; fi
+        done | sort -ru
+}
+
+cmd_webdav_config() {
+    local dir="${1:-$DEFAULT_DIR}"
+    [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
+    load_env "$dir"
+
+    header "当前 WebDAV 配置"
+    printf "  WEBDAV_URL        = %s\n" "${WEBDAV_URL:-（未设置）}"
+    printf "  WEBDAV_USER       = %s\n" "${WEBDAV_USER:-（未设置）}"
+    printf "  WEBDAV_PASSWORD   = %s\n" "${WEBDAV_PASSWORD:+***已设置***}${WEBDAV_PASSWORD:-（未设置）}"
+    printf "  WEBDAV_REMOTE_DIR = %s\n" "${WEBDAV_REMOTE_DIR:-/pg-infra-backup}"
+    printf "  WEBDAV_KEEP       = %s\n" "${WEBDAV_KEEP:-3}（远端保留最近 N 份，0=不清理）"
+    echo
+
+    read -rp "  是否修改配置？[y/N] " yn
+    if [[ "${yn,,}" == "y" ]]; then
+        local val
+        read -rp "  WebDAV 地址（如 https://dav.example.com/remote.php/dav/files/me）[${WEBDAV_URL:-}]: " val
+        [[ -n "$val" ]] && _env_set "$dir" "WEBDAV_URL" "${val%/}"
+        read -rp "  用户名 [${WEBDAV_USER:-}]: " val
+        [[ -n "$val" ]] && _env_set "$dir" "WEBDAV_USER" "$val"
+        read -rsp "  密码 / 应用专用密码（不回显，留空保持不变）: " val; echo
+        if [[ -n "$val" ]]; then
+            [[ "$val" != *$'\n'* ]] || error "密码不能含换行"
+            _env_set "$dir" "WEBDAV_PASSWORD" "$val"
+        fi
+        read -rp "  远端备份目录 [${WEBDAV_REMOTE_DIR:-/pg-infra-backup}]: " val
+        if [[ -n "$val" ]]; then _env_set "$dir" "WEBDAV_REMOTE_DIR" "$val"
+        elif [[ -z "${WEBDAV_REMOTE_DIR:-}" ]]; then _env_set "$dir" "WEBDAV_REMOTE_DIR" "/pg-infra-backup"; fi
+        read -rp "  远端保留最近几份备份（0=不清理）[${WEBDAV_KEEP:-3}]: " val
+        if [[ -n "$val" ]]; then
+            [[ "$val" =~ ^[0-9]+$ ]] || error "保留份数必须是非负整数"
+            _env_set "$dir" "WEBDAV_KEEP" "$val"
+        elif [[ -z "${WEBDAV_KEEP:-}" ]]; then _env_set "$dir" "WEBDAV_KEEP" "3"; fi
+        log "WebDAV 配置已保存（写入 ${dir}/.env）"
+    fi
+
+    read -rp "  是否测试连通性？[y/N] " yn
+    if [[ "${yn,,}" == "y" ]]; then
+        _check_webdav_deps
+        _load_webdav_conf "$dir"
+        local code
+        code=$(_webdav_curl -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 0" "${WEBDAV_URL}/") || code="000"
+        case "$code" in
+            207|200)
+                log "✓ WebDAV 连接与认证正常（HTTP ${code}）"
+                _webdav_mkcol_p "$WEBDAV_REMOTE_DIR"
+                log "✓ 备份目录可用: ${WEBDAV_REMOTE_DIR}"
+                ;;
+            401) warn "✗ 认证失败（HTTP 401）：请检查用户名/密码（Nextcloud 等需使用应用专用密码）" ;;
+            000) warn "✗ 无法连接: ${WEBDAV_URL}" ;;
+            *)   warn "✗ 连接异常（HTTP ${code}）  URL: ${WEBDAV_URL}/" ;;
+        esac
+    fi
+}
+
+cmd_webdav_list() {
+    local dir="${1:-$DEFAULT_DIR}" files
+    _check_webdav_deps
+    _load_webdav_conf "$dir"
+    header "WebDAV 远端备份: ${WEBDAV_URL}${WEBDAV_REMOTE_DIR}/"
+    files=$(_webdav_list "$WEBDAV_REMOTE_DIR") || return 1
+    if [[ -n "$files" ]]; then
+        while IFS= read -r f; do printf "  webdav://%s\n" "$f"; done <<< "$files"
+    else
+        warn "（目录为空或无备份文件）"
     fi
 }
 
 # ════════════════════════════════════════════════════════════
 # 备份 / 恢复
 # ════════════════════════════════════════════════════════════
-# cmd_backup [DIR] [DEST] [--rsync] [--alist] [--encrypt]
+# 本地只保留最近 KEEP 份（仅处理符合备份命名的文件；新备份不存在时不删）
+_local_prune() {   # DEST KEEP JUST_CREATED_NAME
+    local dest="$1" keep="$2" just="$3" f n=0
+    [[ "$keep" =~ ^[0-9]+$ ]] || { warn "LOCAL_BACKUP_KEEP='${keep}' 不是数字，跳过本地清理"; return 0; }
+    (( keep > 0 )) || return 0
+    [[ -f "${dest}/${just}" ]] || return 0
+    while IFS= read -r f; do
+        n=$((n + 1))
+        (( n > keep )) || continue
+        [[ "$f" != "$just" ]] || continue
+        if rm -f -- "${dest}/${f}"; then log "已清理本地旧备份: ${f}"
+        else warn "清理本地旧备份失败: ${f}"; fi
+    done < <(ls -1 -- "$dest" 2>/dev/null | grep -E "$_BK_NAME_RE" | sort -r)
+    return 0
+}
+
+# cmd_backup [DIR] [DEST] [--webdav] [--encrypt]
 cmd_backup() {
-    local do_rsync=0 do_alist=0 do_encrypt=0
+    local do_webdav=0 do_encrypt=0
     local _pos=()
     for _a in "$@"; do
         case "$_a" in
-            --rsync)   do_rsync=1 ;;
-            --alist)   do_alist=1 ;;
+            --webdav)  do_webdav=1 ;;
             --encrypt) do_encrypt=1 ;;
             *) _pos+=("$_a") ;;
         esac
@@ -1147,6 +1059,10 @@ cmd_backup() {
 
     [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
     load_env "$dir"
+    if (( do_webdav )); then   # 先校验远端配置，避免做完耗时的导出才发现没配
+        _check_webdav_deps
+        _load_webdav_conf "$dir"
+    fi
     mkdir -p "$dest"; chmod 700 "$dest" 2>/dev/null || true
 
     local ts; ts=$(date +%Y%m%d_%H%M%S)
@@ -1258,41 +1174,34 @@ EOF
     fi
 
     info "该文件可直接拷走保存；机器重装后执行 restore 即可整体恢复。"
+    _local_prune "$dest" "${LOCAL_BACKUP_KEEP:-3}" "$(basename "$out")"
 
-    (( do_rsync )) && { header "推送备份到 rsync 远端"; _rsync_push "$dir" "$out" ""; }
-    (( do_alist )) && { header "上传备份到 AList 网盘"; _alist_push_file "$dir" "$out"; }
+    if (( do_webdav )); then
+        header "上传备份到 WebDAV"
+        (( do_encrypt )) || warn "备份未加密：归档含 .env（数据库/Redis 密码）和全部数据，将以明文存放在远端，强烈建议加 --encrypt"
+        _load_webdav_conf "$dir"
+        _webdav_mkcol_p "$WEBDAV_REMOTE_DIR"
+        _webdav_put "$out" "$WEBDAV_REMOTE_DIR"
+        _webdav_prune "$WEBDAV_REMOTE_DIR" "${WEBDAV_KEEP:-3}" "$(basename "$out")"
+    fi
 }
 
-# cmd_restore [DIR] <备份tar.gz[.enc]|rsync://...|alist:///...> [解密密钥]
+# cmd_restore [DIR] <备份tar.gz[.enc]|webdav://文件名> [解密密钥]
 cmd_restore() {
-    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <pg-infra-full-backup_*.tar.gz[.enc]|rsync://...|alist:///...> [解密密钥]}"
+    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <pg-infra-full-backup_*.tar.gz[.enc]|webdav://文件名> [解密密钥]}"
     local enc_key="${3:-}"
     _check_dir_safe "$dir"
 
     local _tmp_dir="" _cleanup=0
-    if [[ "$f" == rsync://* ]]; then
-        _check_rsync
-        _parse_rsync_uri "$f"
+    if [[ "$f" == webdav://* ]]; then
+        _check_webdav_deps
+        _load_webdav_conf "$dir"
+        local _wp="${f#webdav://}"
+        [[ "$_wp" == */* ]] || _wp="${WEBDAV_REMOTE_DIR}/${_wp}"   # 纯文件名 → 备份目录下
+        [[ "$_wp" == /* ]]  || _wp="/${_wp}"
         _tmp_dir=$(mktemp -d); _register_tmp "$_tmp_dir"; _cleanup=1
-        local _fname; _fname=$(basename "$RSYNC_URI_PATH")
-        mkdir -p "$dir"
-        local _khf="${dir}/.rsync_known_hosts"; touch "$_khf" 2>/dev/null; chmod 600 "$_khf" 2>/dev/null || true
-        local _ssh_cmd="ssh -p ${RSYNC_URI_PORT} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${_khf} -o BatchMode=yes"
-        [[ -n "${RSYNC_KEY:-}" ]] && _ssh_cmd+=" -i ${RSYNC_KEY}"
-        info "从远端拉取: ${RSYNC_URI_USER}@${RSYNC_URI_HOST}:${RSYNC_URI_PATH}"
-        rsync -avz --progress -e "$_ssh_cmd" \
-            "${RSYNC_URI_USER}@${RSYNC_URI_HOST}:${RSYNC_URI_PATH}" "${_tmp_dir}/" \
-            || { rm -rf "$_tmp_dir"; error "rsync 拉取失败，请检查远端路径和 SSH 配置"; }
-        f="${_tmp_dir}/${_fname}"
-        log "已拉取到临时目录: ${f}"
-    elif [[ "$f" == alist://* ]]; then
-        local _alist_path="${f#alist://}"
-        [[ "$_alist_path" == /* ]] || _alist_path="/${_alist_path}"
-        info "从 AList 网盘获取文件: ${_alist_path}"
-        local _fetched; _fetched=$(_alist_fetch_file "$dir" "$_alist_path")
-        _tmp_dir=$(dirname "$_fetched"); _register_tmp "$_tmp_dir"; _cleanup=1
-        f="$_fetched"
-        log "已从 AList 下载到临时目录: ${f}"
+        _webdav_get "$_wp" "$_tmp_dir"
+        f="${_tmp_dir}/$(basename "$_wp")"
     fi
 
     [[ -f "$f" ]] || { [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"; error "文件不存在: ${f}"; }
@@ -1547,7 +1456,14 @@ menu_update() {
     esac
     warn "将拉取最新镜像并重建 ${target}"
     read -rp "  确认? [y/N] " C; [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    echo; _menu_run cmd_update "$DIR" "$target" || true; _pause
+    local _uflags=() _B _E
+    read -rp "  更新前先做一次全量备份？[Y/n]（推荐） " _B
+    if [[ "${_B,,}" != "n" ]]; then
+        _uflags+=("--backup")
+        read -rp "  备份是否加密？[y/N] " _E
+        [[ "${_E,,}" == "y" ]] && _uflags+=("--encrypt")
+    fi
+    echo; _menu_run cmd_update "$DIR" "$target" ${_uflags[@]+"${_uflags[@]}"} || true; _pause
 }
 
 menu_status() {
@@ -1651,7 +1567,7 @@ menu_bk() {
         echo "  ─────────────────────────────────────────────"
         echo "  1) 全量备份"
         echo "  2) 全量恢复"
-        echo "  3) 远端配置（rsync / AList，仅推送/拉取备份时需要）"
+        echo "  3) WebDAV 远端配置（仅上传/拉取远程备份时需要）"
         echo "  ─────────────────────────────────────────────"
         echo "  0) 返回"
         echo
@@ -1670,30 +1586,39 @@ menu_bk_backup() {
     _db_menu_head "全量备份"
     echo "  保存位置？"
     echo "  1) 仅本地"
-    echo "  2) 本地 + 推送到 rsync 远端"
-    echo "  3) 本地 + 上传到 AList 网盘"
-    read -rp "  请选择 [1-3，默认 1]: " LOC_CH
-    local _flags=()
-    case "$LOC_CH" in
-        2) load_env "$DIR"
-           if [[ -z "${RSYNC_REMOTE:-}" ]]; then
-               warn "尚未配置 rsync 远端，先去配置一下"; menu_bk_remote_config_rsync
-               load_env "$DIR"; [[ -z "${RSYNC_REMOTE:-}" ]] && warn "未完成配置，本次改为仅本地备份"
-           fi
-           [[ -n "${RSYNC_REMOTE:-}" ]] && _flags+=("--rsync") ;;
-        3) load_env "$DIR"
-           if [[ -z "${ALIST_URL:-}" && -z "${ALIST_MOUNT:-}" ]]; then
-               warn "尚未配置 AList 网盘，先去配置一下"; menu_bk_remote_config_alist
-               load_env "$DIR"
-               [[ -z "${ALIST_URL:-}" && -z "${ALIST_MOUNT:-}" ]] && warn "未完成配置，本次改为仅本地备份"
-           fi
-           [[ -n "${ALIST_URL:-}" || -n "${ALIST_MOUNT:-}" ]] && _flags+=("--alist") ;;
-        *) : ;;
-    esac
+    echo "  2) 本地 + 上传到 WebDAV 远端"
+    read -rp "  请选择 [1-2，默认 1]: " LOC_CH
+    local _flags=() _remote=0
+    if [[ "$LOC_CH" == "2" ]]; then
+        if [[ -f "$DIR/.env" ]]; then load_env "$DIR"; fi
+        if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
+            warn "尚未配置 WebDAV 远端，先去配置一下"
+            _menu_run cmd_webdav_config "$DIR" || true
+            if [[ -f "$DIR/.env" ]]; then load_env "$DIR"; fi
+        fi
+        if [[ -n "${WEBDAV_URL:-}" && -n "${WEBDAV_USER:-}" && -n "${WEBDAV_PASSWORD:-}" ]]; then
+            _flags+=("--webdav"); _remote=1
+        else
+            warn "未完成配置，本次改为仅本地备份"
+        fi
+    fi
     _ask "本地输出目录" DEST "${DIR}/backup"
-    read -rp "  是否加密备份归档？[y/N]（推荐；密钥请务必额外保存） " ENC_YN; echo
-    [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
-    _menu_run cmd_backup "$DIR" "$DEST" "${_flags[@]}" || true; _pause
+    if [[ -f "$DIR/.env" ]]; then load_env "$DIR"; fi
+    local _keep
+    _ask "本地保留最近几份备份（0=不清理）" _keep "${LOCAL_BACKUP_KEEP:-3}"
+    if [[ "$_keep" =~ ^[0-9]+$ ]]; then
+        [[ "$_keep" == "${LOCAL_BACKUP_KEEP:-3}" ]] || _env_set "$DIR" "LOCAL_BACKUP_KEEP" "$_keep"
+    else
+        warn "份数无效，沿用 ${LOCAL_BACKUP_KEEP:-3}"
+    fi
+    if (( _remote )); then
+        read -rp "  是否加密备份归档？[Y/n]（上传远端强烈建议加密；密钥请务必额外保存） " ENC_YN; echo
+        [[ "${ENC_YN,,}" != "n" ]] && _flags+=("--encrypt")
+    else
+        read -rp "  是否加密备份归档？[y/N]（推荐；密钥请务必额外保存） " ENC_YN; echo
+        [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
+    fi
+    _menu_run cmd_backup "$DIR" "$DEST" ${_flags[@]+"${_flags[@]}"} || true; _pause
 }
 
 menu_bk_restore() {
@@ -1701,59 +1626,37 @@ menu_bk_restore() {
     info "支持机器重装后的场景：DIR 可以是全新目录，将从备份归档重建全部配置和数据"
     echo "  备份来源？"
     echo "  1) 本地文件"
-    echo "  2) rsync 远端"
-    echo "  3) AList 网盘"
-    read -rp "  请选择 [1-3，默认 1]: " SRC_CH
+    echo "  2) WebDAV 远端"
+    read -rp "  请选择 [1-2，默认 1]: " SRC_CH
     local BK_FILE=""
     case "$SRC_CH" in
         2)
-            load_env "$DIR" 2>/dev/null || true
-            info "正在列出 rsync 远端目录..."
-            ( _load_rsync_conf "$DIR" 2>/dev/null && _rsync_list "$DIR" 2>/dev/null ) \
-                || warn "无法列出远端文件（请确认已在「远端配置」里配置过 rsync）"
+            if [[ -f "$DIR/.env" ]]; then load_env "$DIR" 2>/dev/null || true; fi
+            if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
+                info "本机没有 WebDAV 配置（全新机器），请临时输入连接信息（仅本次使用，不落盘）"
+                _ask "WebDAV 地址（如 https://dav.example.com/remote.php/dav/files/me）" WEBDAV_URL ""
+                _ask "用户名" WEBDAV_USER ""
+                read -rsp "  密码（不回显）: " WEBDAV_PASSWORD; echo
+                _ask "远端备份目录" WEBDAV_REMOTE_DIR "${WEBDAV_REMOTE_DIR:-/pg-infra-backup}"
+                export WEBDAV_URL WEBDAV_USER WEBDAV_PASSWORD WEBDAV_REMOTE_DIR
+            fi
+            info "正在列出 WebDAV 远端备份（新→旧）..."
+            _menu_run cmd_webdav_list "$DIR" || warn "无法列出远端文件，请检查 WebDAV 配置/网络"
             echo
-            _ask "远端文件路径（rsync://user@host[:port]/path/pg-infra-full-backup_*.tar.gz[.enc]）" BK_FILE ""
-            ;;
-        3)
-            load_env "$DIR" 2>/dev/null || true
-            info "正在列出 AList 网盘目录..."
-            ( _alist_list "$DIR" 2>/dev/null ) \
-                || warn "无法列出网盘文件（请确认已在「远端配置」里配置过 AList）"
-            echo
-            echo "  输入格式: alist:///AList内部路径/文件名.tar.gz"
-            _ask "AList 文件路径（alist:///...）" BK_FILE ""
+            _ask "远端文件（webdav://文件名）" BK_FILE ""
             ;;
         *)
             _ask "全量备份文件（pg-infra-full-backup_*.tar.gz 或 .tar.gz.enc）" BK_FILE ""
             ;;
     esac
     [[ -n "$BK_FILE" ]] || { warn "不能为空"; _pause; return; }
+    [[ "$SRC_CH" == "2" && "$BK_FILE" != webdav://* ]] && BK_FILE="webdav://${BK_FILE}"
     echo; _menu_run cmd_restore "$DIR" "$BK_FILE" || true; _pause
 }
 
 menu_bk_remote_config() {
-    _mhdr; _c "1;33" "  ▶ 远端配置"; echo
-    echo "  1) 配置 / 测试 rsync 远端"
-    echo "  2) 配置 / 测试 AList 网盘"
-    echo "  0) 返回"
-    echo
-    read -rp "  请选择 [0-2]: " CH
-    case "$CH" in
-        1) menu_bk_remote_config_rsync ;;
-        2) menu_bk_remote_config_alist ;;
-        0) return ;;
-        *) warn "无效选项"; sleep 1 ;;
-    esac
-}
-
-menu_bk_remote_config_rsync() {
-    _db_menu_head "配置 rsync 远端"
-    _menu_run cmd_rsync_config "$DIR" || true; _pause
-}
-
-menu_bk_remote_config_alist() {
-    _db_menu_head "配置 AList 连接"
-    _menu_run cmd_alist_config "$DIR" || true; _pause
+    _db_menu_head "配置 WebDAV 远端"
+    _menu_run cmd_webdav_config "$DIR" || true; _pause
 }
 
 menu_tune() {
@@ -1802,8 +1705,8 @@ main() {
         restore)      cmd_restore      "$@" ;;
         tune-db)      cmd_tune_db      "$@" ;;
         tune-redis)   cmd_tune_redis   "$@" ;;
-        rsync-config) cmd_rsync_config "$@" ;;
-        alist-config) cmd_alist_config "$@" ;;
+        webdav-config) cmd_webdav_config "$@" ;;
+        webdav-list)   cmd_webdav_list   "$@" ;;
         status)    cmd_status   "$@" ;;
         start)     cmd_start    "$@" ;;
         stop)      cmd_stop     "$@" ;;
