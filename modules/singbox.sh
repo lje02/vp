@@ -423,15 +423,54 @@ apply_cert() {
     systemctl start sing-box 2>/dev/null; pause
 }
 
+# [修复] 备份归档格式: bin/sing-box + etc/ (二进制与配置分目录，避免同名冲突)
+_make_backup_archive() {
+    local dest=$1 tmp bin rc
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/bin" "$tmp/etc"
+    bin=$(command -v sing-box 2>/dev/null)
+    [[ -n "$bin" && -f "$bin" ]] && cp "$bin" "$tmp/bin/sing-box"
+    [[ -d /etc/sing-box ]] && cp -a /etc/sing-box/. "$tmp/etc/"
+    tar -czf "$dest" -C "$tmp" . >/dev/null 2>&1; rc=$?
+    rm -rf "$tmp"
+    [[ $rc -eq 0 ]] && chmod 600 "$dest"
+    return $rc
+}
+
+# 还原：兼容新格式 (bin/ + etc/) 与旧版脚本生成的两种归档
+_restore_backup_archive() {
+    local archive=$1 tmp bin_dst f
+    tmp=$(mktemp -d)
+    if ! tar -xzf "$archive" -C "$tmp"; then rm -rf "$tmp"; return 1; fi
+    bin_dst=$(command -v sing-box 2>/dev/null); bin_dst=${bin_dst:-/usr/local/bin/sing-box}
+    mkdir -p /etc/sing-box
+    if [[ -d "$tmp/etc" || -d "$tmp/bin" ]]; then
+        [[ -f "$tmp/bin/sing-box" ]] && install -m 755 "$tmp/bin/sing-box" "$bin_dst"
+        [[ -d "$tmp/etc" ]] && cp -a "$tmp/etc/." /etc/sing-box/
+    else
+        [[ -f "$tmp/sing-box" ]] && install -m 755 "$tmp/sing-box" "$bin_dst"
+        if [[ -d "$tmp/sing-box" ]]; then
+            cp -a "$tmp/sing-box/." /etc/sing-box/
+        else
+            for f in "$tmp"/* "$tmp"/.[!.]*; do
+                [[ -e "$f" ]] || continue
+                [[ -f "$f" && "$(basename "$f")" == "sing-box" ]] && continue
+                cp -a "$f" /etc/sing-box/
+            done
+        fi
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
 auto_backup() {
     mkdir -p "$BACKUP_DIR"
-    local TIME=$(date +%Y%m%d_%H%M%S) TMP_BAK
-    TMP_BAK=$(mktemp -d)
-    [[ -f /usr/local/bin/sing-box ]] && cp /usr/local/bin/sing-box "$TMP_BAK/"
-    [[ -d /etc/sing-box           ]] && cp -r /etc/sing-box/*       "$TMP_BAK/"
-    tar -czf "$BACKUP_DIR/auto_bak_before_update_$TIME.tar.gz" -C "$TMP_BAK" . >/dev/null 2>&1
-    rm -rf "$TMP_BAK"
-    echo -e "${YELLOW}[自动快照] 已备份: auto_bak_before_update_$TIME.tar.gz${PLAIN}"
+    local TIME; TIME=$(date +%Y%m%d_%H%M%S)
+    if _make_backup_archive "$BACKUP_DIR/auto_bak_before_update_$TIME.tar.gz"; then
+        echo -e "${YELLOW}[自动快照] 已备份: auto_bak_before_update_$TIME.tar.gz${PLAIN}"
+    else
+        echo -e "${RED}[自动快照] 备份失败，请检查磁盘空间与权限${PLAIN}"
+    fi
 }
 
 backup_restore() {
@@ -443,31 +482,34 @@ backup_restore() {
     mkdir -p "$BACKUP_DIR"
 
     if [[ "$br_choice" == "1" ]]; then
-        local TIME=$(date +%Y%m%d_%H%M%S) TMP_BAK
-        TMP_BAK=$(mktemp -d)
-        [[ -f /usr/local/bin/sing-box ]] && cp /usr/local/bin/sing-box "$TMP_BAK/"
-        [[ -d /etc/sing-box           ]] && cp -r /etc/sing-box        "$TMP_BAK/"
-        tar -czf "$BACKUP_DIR/singbox_full_$TIME.tar.gz" -C "$TMP_BAK" .
-        rm -rf "$TMP_BAK"
-        echo -e "${GREEN}✔ 备份完成: singbox_full_$TIME.tar.gz${PLAIN}"
+        local TIME; TIME=$(date +%Y%m%d_%H%M%S)
+        if _make_backup_archive "$BACKUP_DIR/singbox_full_$TIME.tar.gz"; then
+            echo -e "${GREEN}✔ 备份完成: $BACKUP_DIR/singbox_full_$TIME.tar.gz${PLAIN}"
+        else
+            echo -e "${RED}✘ 备份失败${PLAIN}"
+        fi
 
     elif [[ "$br_choice" == "2" ]]; then
-        local files=( $(ls "$BACKUP_DIR" 2>/dev/null | grep "\.tar\.gz") )
+        local files=() n=1 f
+        mapfile -t files < <(ls -1 "$BACKUP_DIR" 2>/dev/null | grep '\.tar\.gz$')
         if [[ ${#files[@]} -eq 0 ]]; then
             echo -e "${RED}没有找到备份文件${PLAIN}"
         else
-            ls "$BACKUP_DIR" | grep "\.tar\.gz" | cat -n
+            for f in "${files[@]}"; do echo "  $n) $f"; ((n++)); done
             read -p "选择要还原的序号: " r_idx
             if ! validate_index "$r_idx" "${#files[@]}"; then pause; return; fi
-            local R_FILE="${files[$((r_idx-1))]}" TMP_RST
-            TMP_RST=$(mktemp -d)
+            local R_FILE="${files[$((r_idx-1))]}"
             systemctl stop sing-box
-            tar -xzf "$BACKUP_DIR/$R_FILE" -C "$TMP_RST"
-            [[ -f "$TMP_RST/sing-box"     ]] && cp    "$TMP_RST/sing-box"    /usr/local/bin/sing-box
-            [[ -d "$TMP_RST/sing-box"     ]] && cp -r "$TMP_RST/sing-box/"*  /etc/sing-box/
-            rm -rf "$TMP_RST"
-            systemctl restart sing-box
-            echo -e "${GREEN}✔ 还原 $R_FILE 完成${PLAIN}"
+            if _restore_backup_archive "$BACKUP_DIR/$R_FILE"; then
+                if ! $SB_BIN check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+                    echo -e "${YELLOW}⚠ 还原后的配置未通过校验，请检查 $CONFIG_FILE${PLAIN}"
+                fi
+                systemctl restart sing-box
+                echo -e "${GREEN}✔ 还原 $R_FILE 完成${PLAIN}"
+            else
+                echo -e "${RED}✘ 解压备份失败，未做任何修改${PLAIN}"
+                systemctl start sing-box
+            fi
         fi
     fi
     pause
@@ -1040,40 +1082,60 @@ edit_node() {
     echo "0. 返回"
     read -p "请选择操作: " op
 
+    # [修复] 所有用户输入都通过 jq --arg 传入，不再拼进 jq 程序
     case $op in
         1)
             read -p "新端口: " NEW_PORT; [[ -z "$NEW_PORT" ]] && return
             if ! check_port "$NEW_PORT"; then pause; return; fi
             make_tmp
-            jq ".inbounds[$i].listen_port = ($NEW_PORT|tonumber)" "$CONFIG_FILE" > "$_TMP_JSON"
+            jq --argjson i "$i" --arg p "$NEW_PORT" \
+               '.inbounds[$i].listen_port = ($p|tonumber)' "$CONFIG_FILE" > "$_TMP_JSON"
             ;;
         2)
-            # [F10] TUIC 同时有 uuid 和 password，分别处理
             if [[ "$TYPE" == "tuic" ]]; then
                 read -p "新 UUID (回车跳过): " NEW_UUID
                 read -p "新密码   (回车跳过): " NEW_PASS
                 [[ -z "$NEW_UUID" && -z "$NEW_PASS" ]] && return
                 make_tmp
-                local JQ_F="."
-                [[ -n "$NEW_UUID" ]] && JQ_F="$JQ_F | .inbounds[$i].users[0].uuid     = \"$NEW_UUID\""
-                [[ -n "$NEW_PASS" ]] && JQ_F="$JQ_F | .inbounds[$i].users[0].password = \"$NEW_PASS\""
-                jq "$JQ_F" "$CONFIG_FILE" > "$_TMP_JSON"
+                jq --argjson i "$i" --arg u "$NEW_UUID" --arg p "$NEW_PASS" '
+                    (if $u != "" then .inbounds[$i].users[0].uuid     = $u else . end) |
+                    (if $p != "" then .inbounds[$i].users[0].password = $p else . end)' \
+                    "$CONFIG_FILE" > "$_TMP_JSON"
             else
-                local AUTH_FIELD=".users[0].uuid"
-                [[ "$TYPE" =~ ^(trojan|hysteria2|http)$ ]] && AUTH_FIELD=".users[0].password"
-                [[ "$TYPE" == "shadowsocks" ]]              && AUTH_FIELD=".password"
-                read -p "新凭证: " NEW_AUTH; [[ -z "$NEW_AUTH" ]] && return
+                # [修复] 按协议选对字段：anytls / socks 之前误用 uuid 导致校验失败
+                local AUTH_PATH=""
+                case "$TYPE" in
+                    vless)                                  AUTH_PATH='.users[0].uuid' ;;
+                    trojan|hysteria2|http|socks|anytls)     AUTH_PATH='.users[0].password' ;;
+                    shadowsocks)                            AUTH_PATH='.password' ;;
+                    *) echo -e "${RED}✘ 暂不支持修改 $TYPE 的凭证${PLAIN}"; pause; return ;;
+                esac
+                local NEW_AUTH=""
+                if [[ "$TYPE" == "shadowsocks" ]]; then
+                    read -p "新密钥 (回车自动生成合法 base64 密钥): " NEW_AUTH
+                    if [[ -z "$NEW_AUTH" ]]; then
+                        local _m _len=16
+                        _m=$(jq -r ".inbounds[$i].method" "$CONFIG_FILE")
+                        [[ "$_m" == *256* || "$_m" == *chacha20* ]] && _len=32
+                        NEW_AUTH=$(openssl rand -base64 "$_len")
+                    fi
+                else
+                    local _prompt="新密码"; [[ "$TYPE" == "vless" ]] && _prompt="新 UUID"
+                    read -p "$_prompt: " NEW_AUTH; [[ -z "$NEW_AUTH" ]] && return
+                fi
                 make_tmp
-                jq ".inbounds[$i]$AUTH_FIELD = \"$NEW_AUTH\"" "$CONFIG_FILE" > "$_TMP_JSON"
+                jq --argjson i "$i" --arg v "$NEW_AUTH" ".inbounds[\$i]${AUTH_PATH} = \$v" \
+                    "$CONFIG_FILE" > "$_TMP_JSON"
             fi
             ;;
         3)
             read -p "新 SNI: " NEW_SNI; [[ -z "$NEW_SNI" ]] && return
             make_tmp
-            jq ".inbounds[$i].tls.server_name = \"$NEW_SNI\" |
+            jq --argjson i "$i" --arg s "$NEW_SNI" '
+                .inbounds[$i].tls.server_name = $s |
                 if .inbounds[$i].tls.reality then
-                    .inbounds[$i].tls.reality.handshake.server = \"$NEW_SNI\"
-                else . end" "$CONFIG_FILE" > "$_TMP_JSON"
+                    .inbounds[$i].tls.reality.handshake.server = $s
+                else . end' "$CONFIG_FILE" > "$_TMP_JSON"
             ;;
         4)
             read -p "确定删除 $TAG 及关联路由？(y/n): " confirm
@@ -1099,12 +1161,21 @@ edit_node() {
     if [[ -n "$_TMP_JSON" && -f "$_TMP_JSON" ]]; then
         if save_and_restart; then
             echo -e "${GREEN}✔ 配置已更新！${PLAIN}"
-            local CONF PORT IP SNI NEW_LINK
-            CONF=$(jq -c ".inbounds[] | select(.tag == \"$TAG\")" "$CONFIG_FILE")
+            local CONF PORT IP SNI NEW_LINK INS CERT_P OLD_LINK=""
+            CONF=$(jq -c --arg t "$TAG" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
             [[ -z "$CONF" ]] && pause && return
             PORT=$(echo "$CONF" | jq -r .listen_port)
             IP=$(get_ip)
             SNI=$(echo "$CONF" | jq -r '.tls.server_name // ""')
+
+            # 旧链接里的信息(自签证书的 sni、Reality 公钥)不在 config.json 中，需要从中取回
+            [[ -f "$LINK_DIR/${TAG}.link" ]] && OLD_LINK=$(cat "$LINK_DIR/${TAG}.link")
+            _oq() { echo "$OLD_LINK" | grep -oP "(?<=[?&]$1=)[^&#]+" | head -1; }
+            [[ -z "$SNI" ]] && SNI=$(_oq sni)
+
+            # 证书在 sing-box/certbot 目录下 => 受信任(0)；否则视为自签(1)
+            CERT_P=$(echo "$CONF" | jq -r '.tls.certificate_path // ""')
+            if [[ "$CERT_P" == "$CERT_DIR"/* || "$CERT_P" == /etc/letsencrypt/* ]]; then INS=0; else INS=1; fi
 
             case $TYPE in
                 vless)
@@ -1113,10 +1184,7 @@ edit_node() {
                     SID=$(echo  "$CONF" | jq -r '.tls.reality.short_id[0] // ""')
                     FLOW=$(echo "$CONF" | jq -r '.users[0].flow // ""')
                     if [[ -n "$SID" ]]; then
-                        # [F07] 从旧 .link 文件读取 pbk，避免丢失
-                        local OLD_PBK=""
-                        [[ -f "$LINK_DIR/${TAG}.link" ]] && \
-                            OLD_PBK=$(grep -oP '(?<=pbk=)[^&]+' "$LINK_DIR/${TAG}.link" 2>/dev/null || true)
+                        local OLD_PBK; OLD_PBK=$(_oq pbk)
                         if [[ -n "$OLD_PBK" ]]; then
                             NEW_LINK="vless://$UUID@$IP:$PORT?security=reality&sni=$SNI&fp=chrome&pbk=$OLD_PBK&sid=$SID&type=tcp&flow=$FLOW#$TAG"
                         else
@@ -1124,29 +1192,61 @@ edit_node() {
                         fi
                     else
                         local WSPATH; WSPATH=$(echo "$CONF" | jq -r '.transport.path // ""')
-                        NEW_LINK="vless://$UUID@${SNI:-$IP}:$PORT?encryption=none&security=tls&type=ws&host=$SNI&path=$WSPATH#$TAG"
+                        NEW_LINK="vless://$UUID@${SNI:-$IP}:$PORT?encryption=none&security=tls&type=ws&host=$SNI&path=${WSPATH//\//%2F}#$TAG"
                     fi ;;
                 trojan)
                     local PASS; PASS=$(echo "$CONF" | jq -r '.users[0].password')
-                    NEW_LINK="trojan://$PASS@$IP:$PORT?security=tls&sni=$SNI&allowInsecure=1#$TAG" ;;
+                    NEW_LINK="trojan://$PASS@$IP:$PORT?security=tls&sni=$SNI&allowInsecure=$INS#$TAG" ;;
                 hysteria2)
-                    local PASS; PASS=$(echo "$CONF" | jq -r '.users[0].password')
-                    NEW_LINK="hysteria2://$PASS@$IP:$PORT?sni=$SNI&insecure=1#$TAG" ;;
+                    # [修复] 保留 obfs 参数，否则启用混淆的节点改完后客户端无法连接
+                    local PASS OBFS_T OBFS_P OBFS_Q=""
+                    PASS=$(echo   "$CONF" | jq -r '.users[0].password')
+                    OBFS_T=$(echo "$CONF" | jq -r '.obfs.type // ""')
+                    OBFS_P=$(echo "$CONF" | jq -r '.obfs.password // ""')
+                    [[ -n "$OBFS_T" ]] && OBFS_Q="&obfs=${OBFS_T}&obfs-password=${OBFS_P}"
+                    NEW_LINK="hysteria2://$PASS@$IP:$PORT?insecure=$INS&sni=$SNI${OBFS_Q}#$TAG" ;;
                 tuic)
                     local UUID PASS
                     UUID=$(echo "$CONF" | jq -r '.users[0].uuid')
                     PASS=$(echo "$CONF" | jq -r '.users[0].password')
-                    NEW_LINK="tuic://$UUID:$PASS@$IP:$PORT?congestion_control=bbr&sni=$SNI&alpn=h3&allow_insecure=1#$TAG" ;;
+                    NEW_LINK="tuic://$UUID:$PASS@$IP:$PORT?sni=$SNI&alpn=h3&allow_insecure=$INS&congestion_control=bbr#$TAG" ;;
                 shadowsocks)
                     local METHOD PASS
                     METHOD=$(echo "$CONF" | jq -r .method)
                     PASS=$(echo   "$CONF" | jq -r .password)
                     NEW_LINK="ss://$(echo -n "$METHOD:$PASS" | base64 -w 0)@$IP:$PORT#$TAG" ;;
+                anytls)
+                    # [修复] 之前没有 anytls 分支，旧链接里的端口/密码不会更新
+                    local PASS SID
+                    PASS=$(echo "$CONF" | jq -r '.users[0].password')
+                    SID=$(echo  "$CONF" | jq -r '.tls.reality.short_id[0] // ""')
+                    if [[ -n "$SID" ]]; then
+                        local OLD_PBK; OLD_PBK=$(_oq pbk)
+                        if [[ -n "$OLD_PBK" ]]; then
+                            NEW_LINK="anytls://${PASS}@${IP}:${PORT}?security=reality&sni=${SNI}&fp=chrome&pbk=${OLD_PBK}&sid=${SID}&type=tcp#${TAG}"
+                        else
+                            echo -e "${YELLOW}⚠ 无法获取 Reality 公钥，建议删除重建节点。${PLAIN}"
+                        fi
+                    else
+                        NEW_LINK="anytls://${PASS}@${IP}:${PORT}?sni=${SNI}&insecure=${INS}#${TAG}"
+                    fi ;;
+                http)
+                    local HUSER HPASS
+                    HUSER=$(echo "$CONF" | jq -r '.users[0].username // ""')
+                    HPASS=$(echo "$CONF" | jq -r '.users[0].password // ""')
+                    NEW_LINK="https://$HUSER:$HPASS@$IP:$PORT?security=tls&sni=$SNI&allowInsecure=$INS#$TAG" ;;
+                socks)
+                    local SUSER SPASS
+                    SUSER=$(echo "$CONF" | jq -r '.users[0].username // ""')
+                    SPASS=$(echo "$CONF" | jq -r '.users[0].password // ""')
+                    NEW_LINK="socks5://$SUSER:$SPASS@$IP:$PORT#$TAG" ;;
             esac
             if [[ -n "$NEW_LINK" ]]; then
                 echo "$NEW_LINK" > "$LINK_DIR/${TAG}.link"
                 echo -e "新分享链接:\n${BLUE}$NEW_LINK${PLAIN}"
             fi
+            # [修复] 修改后同步刷新订阅文件
+            refresh_sub
         fi
     fi
     pause
@@ -1556,10 +1656,17 @@ manage_routing() {
                         keys[] as $i | "\($i+1)) [\(.[$i].type)] \(.[$i].tag)"' "$CONFIG_FILE"
                     read -p "序号 (逗号隔开): " m_idxs
                     [[ -z "$m_idxs" ]] && continue
-                    local MEMBER_TAGS
-                    MEMBER_TAGS=$(echo "$m_idxs" | tr ',' '\n' | while read -r i; do
-                        jq -r ".outbounds[$((i-1))].tag" "$CONFIG_FILE"
-                    done | jq -R . | jq -s . -c)
+                    # [修复] 列表是过滤后的序号，取 tag 时必须用同样的过滤数组，不能直接索引 .outbounds
+                    local MEMBER_TAGS _mi _mt _mbad=0 _mlist=()
+                    while IFS= read -r _mi; do
+                        _mi=$(echo "$_mi" | tr -d ' ')
+                        if ! validate_index "$_mi" "$ob_count"; then _mbad=1; break; fi
+                        _mt=$(jq -r "[.outbounds[] | select(.type!=\"direct\" and .type!=\"dns\" and .type!=\"block\")] | .[$((_mi-1))].tag" "$CONFIG_FILE")
+                        _mlist+=("$_mt")
+                    done < <(echo "$m_idxs" | tr ',' '\n')
+                    [[ "$_mbad" -eq 1 ]] && pause && continue
+                    [[ ${#_mlist[@]} -eq 0 ]] && continue
+                    MEMBER_TAGS=$(printf '%s\n' "${_mlist[@]}" | jq -R . | jq -s -c .)
                     OUT_TAG="group-out-$(date +%s)"
                     if [[ "$out_mode" == "3" ]]; then
                         OUT_JSON=$(jq -n --arg t "$OUT_TAG" --argjson m "$MEMBER_TAGS" \
@@ -1616,10 +1723,15 @@ manage_routing() {
                             select(.key as $k | ($dels | index($k)) == null) | .value]' \
                         "$CONFIG_FILE" > "$T1"
                     # 清理不再被规则引用的 route-out/group-out 出站
-                    jq '.outbounds |= map(select(
-                        ((.tag | (startswith("route-out-") or startswith("group-out-"))) | not) or
-                        (.tag as $t | any(.route.rules[]; .outbound == $t))
-                    ))' "$T1" > "$T2" && rm -f "$T1"
+                    # [修复] map 内 . 是单个出站，需先把根对象存为 $root，再引用 route.rules
+                    if ! jq '. as $root | .outbounds |= map(select(
+                        ((.tag // "" | (startswith("route-out-") or startswith("group-out-"))) | not) or
+                        (.tag as $t | any($root.route.rules[]?; .outbound == $t))
+                    ))' "$T1" > "$T2"; then
+                        echo -e "${RED}✖ 处理规则失败，已取消！${PLAIN}"
+                        rm -f "$T1" "$T2"; pause; continue
+                    fi
+                    rm -f "$T1"
                     if $SB_BIN check -c "$T2" > /dev/null 2>&1; then
                         mv "$T2" "$CONFIG_FILE"
                     else
@@ -2143,6 +2255,20 @@ httpd.serve_forever()
 PYEOF2
 }
 
+# [修复] 订阅服务依赖 python3，最小化系统可能没有
+_ensure_python3() {
+    command -v python3 &>/dev/null && return 0
+    echo -e "${CYAN}未检测到 python3，正在安装 (订阅服务依赖)...${PLAIN}"
+    if   command -v apt-get &>/dev/null; then apt-get update -y >/dev/null 2>&1; apt-get install -y python3
+    elif command -v dnf     &>/dev/null; then dnf install -y python3
+    elif command -v yum     &>/dev/null; then yum install -y python3
+    fi
+    if ! command -v python3 &>/dev/null; then
+        echo -e "${RED}✘ python3 安装失败，无法启动订阅服务${PLAIN}"; return 1
+    fi
+    return 0
+}
+
 manage_subscription() {
     while true; do
         clear
@@ -2177,7 +2303,9 @@ manage_subscription() {
                 sub_proto=${sub_proto:-$LAST_PROTO}
                 echo "$sub_proto" > /etc/sing-box/.sub_proto
 
-                local SUB_PORT EXEC_CMD SUB_URL
+                local SUB_PORT EXEC_CMD SUB_URL PY3
+                _ensure_python3 || { pause; continue; }
+                PY3=$(command -v python3)
                 mkdir -p /var/www/singbox-sub
 
                 # 【修复核心：固定订阅路径】
@@ -2192,7 +2320,8 @@ manage_subscription() {
                     echo -e "${YELLOW}首次生成订阅，已创建安全路径: ${SUB_PATH}${PLAIN}"
                 fi
 
-                local LAST_PORT; [[ -f "/etc/sing-box/.sub_port" ]] && LAST_PORT=$(cat /etc/sing-box/.sub_port)
+                local LAST_PORT=""; [[ -f "/etc/sing-box/.sub_port" ]] && LAST_PORT=$(cat /etc/sing-box/.sub_port)
+                local PREV_PORT="$LAST_PORT"
 
                 if [[ "$sub_proto" == "2" ]]; then
                     read -p "请输入已申请证书的域名 (例如 node.example.com): " sub_domain
@@ -2205,23 +2334,25 @@ manage_subscription() {
                     LAST_PORT=${LAST_PORT:-8443}
                     read -p "请输入 HTTPS 订阅服务端口 (当前/默认 ${LAST_PORT}): " SUB_PORT
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
-                    echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
                     write_sub_server
-                    EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/sub_server.py $SUB_PORT $CERT_PATH $KEY_PATH"
+                    EXEC_CMD="$PY3 /var/www/singbox-sub/sub_server.py $SUB_PORT $CERT_PATH $KEY_PATH"
                     SUB_URL="https://$sub_domain:$SUB_PORT/$SUB_PATH"
                 else
                     LAST_PORT=${LAST_PORT:-8080}
                     read -p "请输入 HTTP 订阅服务端口 (当前/默认 ${LAST_PORT}): " SUB_PORT
                     SUB_PORT=${SUB_PORT:-$LAST_PORT}
-                    echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
                     write_sub_server
-                    EXEC_CMD="/usr/bin/python3 /var/www/singbox-sub/sub_server.py $SUB_PORT"
+                    EXEC_CMD="$PY3 /var/www/singbox-sub/sub_server.py $SUB_PORT"
                     SUB_URL="http://$(get_ip):$SUB_PORT/$SUB_PATH"
                 fi
 
-                if ! check_port "$SUB_PORT"; then pause; continue; fi
+                # [修复] 更新场景下端口正被订阅服务自身占用，不能当作冲突
+                if systemctl is-active --quiet singbox-sub 2>/dev/null && [[ "$SUB_PORT" == "$PREV_PORT" ]]; then
+                    :
+                elif ! check_port "$SUB_PORT"; then pause; continue; fi
+                echo "$SUB_PORT" > /etc/sing-box/.sub_port
 
                 echo -e "${CYAN}生成/刷新订阅文件...${PLAIN}"
                 refresh_sub
@@ -2257,7 +2388,7 @@ EOF
             2)
                 if systemctl is-active --quiet singbox-sub 2>/dev/null && [[ -f "/var/www/singbox-sub/.url_cache" ]]; then
                     echo -e "\n你的专属订阅链接为:\n${BLUE}$(cat /var/www/singbox-sub/.url_cache)${PLAIN}"
-                    echo -e "${YELLOW}提示: 路径具有唯一性，每次开启都会随机变化以保证安全。${PLAIN}"
+                    echo -e "${YELLOW}提示: 路径在首次开启时随机生成，之后更新会沿用；关闭订阅服务会清除，下次开启重新生成。${PLAIN}"
                 else
                     echo -e "\n${RED}✘ 订阅服务未开启，或链接缓存丢失！${PLAIN}"
                 fi
@@ -2302,86 +2433,172 @@ update_kernel() {
 # ============================================================
 # 一键部署 WARP 并对接 Sing-box 出站 (适配最新版 warp-cli)
 # ============================================================
+# WARP 本地代理端口
+WARP_PORT=40000
+
+_warp_abort() { echo -e "${RED}✘ $1${PLAIN}"; pause; }
+
+# 是否已有注册（命令失败、或输出包含 missing 等字样都视为未注册）
+_warp_registered() {
+    local out; out=$(warp-cli --accept-tos registration show 2>&1) || return 1
+    echo "$out" | grep -qiE 'missing|no registration|not registered|unable to connect' && return 1
+    return 0
+}
+
+# 切到代理模式并绑定端口；仅当全部成功(且 settings 可读时确认含 proxy)才返回 0
+_warp_set_proxy() {
+    warp-cli --accept-tos mode proxy >/dev/null 2>&1 || return 1
+    warp-cli --accept-tos proxy port "$WARP_PORT" >/dev/null 2>&1 || return 1
+    local st
+    if st=$(warp-cli --accept-tos settings 2>/dev/null) && [[ -n "$st" ]]; then
+        echo "$st" | grep -qi 'proxy' || return 1
+    fi
+    return 0
+}
+
 setup_warp_outbound() {
     clear
     echo -e "${YELLOW}--- 一键部署 WARP 并对接 Sing-box 出站 ---${PLAIN}"
-    
-    # 1. 检查并安装 warp-cli
+    local k
+
+    # 1. 检查并安装 warp-cli（每一步都检查返回值）
     if ! command -v warp-cli &> /dev/null; then
         echo -e "${CYAN}检测到未安装 warp-cli，开始自动拉取并安装...${PLAIN}"
         if command -v apt-get &> /dev/null; then
-            apt-get update -y && apt-get install -y curl lsb-release gnupg
-            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-            apt-get update -y && apt-get install -y cloudflare-warp
+            apt-get update -y && apt-get install -y curl lsb-release gnupg \
+                || { _warp_abort "依赖安装失败"; return; }
+            local codename; codename=$(lsb_release -cs 2>/dev/null)
+            [[ -z "$codename" ]] && { _warp_abort "无法识别发行版代号 (lsb_release -cs)"; return; }
+            local tmp_key; tmp_key=$(mktemp)
+            if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$tmp_key"; then
+                rm -f "$tmp_key"; _warp_abort "下载 Cloudflare GPG 公钥失败"; return; fi
+            if ! gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$tmp_key"; then
+                rm -f "$tmp_key"; _warp_abort "导入 GPG 公钥失败"; return; fi
+            rm -f "$tmp_key"
+            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
+                > /etc/apt/sources.list.d/cloudflare-client.list
+            if ! { apt-get update -y && apt-get install -y cloudflare-warp; }; then
+                # 失败时移除源，避免之后每次 apt update 都报错
+                rm -f /etc/apt/sources.list.d/cloudflare-client.list
+                _warp_abort "cloudflare-warp 安装失败，可能是当前发行版代号 ($codename) 未被 Cloudflare 仓库支持"; return
+            fi
         elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
-            curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
+            if ! curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo -o /etc/yum.repos.d/cloudflare-warp.repo; then
+                _warp_abort "下载 Cloudflare 软件源配置失败"; return; fi
             if command -v dnf &> /dev/null; then
-                dnf install -y cloudflare-warp
+                dnf install -y cloudflare-warp || { _warp_abort "cloudflare-warp 安装失败"; return; }
             else
-                yum install -y cloudflare-warp
+                yum install -y cloudflare-warp || { _warp_abort "cloudflare-warp 安装失败"; return; }
             fi
         else
-            echo -e "${RED}✘ 不支持的系统包管理器，请手动安装 cloudflare-warp。${PLAIN}"
-            pause; return
+            _warp_abort "不支持的系统包管理器，请手动安装 cloudflare-warp。"; return
         fi
+        command -v warp-cli &> /dev/null || { _warp_abort "安装后仍未找到 warp-cli"; return; }
     fi
 
-    # 2. 静默注册并配置本地 Socks5 代理模式
-    echo -e "\n${CYAN}配置 WARP 本地代理隧道...${PLAIN}"
-    
-    # 强制重置可能存在的旧状态 (适配新版语法)
-    warp-cli --accept-tos disconnect 2>/dev/null
-    warp-cli --accept-tos registration delete 2>/dev/null
-
-    # 先切换到代理模式并绑定端口，再注册/连接
-    # 目的：避免注册后 warp-svc 按默认的全隧道 (warp) 模式自动发起连接，
-    # 那样会把 VPS 全部流量（含 SSH）瞬间劫持进隧道，导致连接中断
-    warp-cli --accept-tos mode proxy
-    warp-cli --accept-tos proxy port 40000
-
-    # 执行全自动流：代理模式 -> 绑定端口 -> 注册 -> 连接 (适配新版语法)
-    # 用 yes 兜底，防止个别版本的 registration new 仍会弹出交互确认导致脚本卡死
-    if yes | warp-cli --accept-tos registration new; then
-        warp-cli --accept-tos connect
-        
-        echo -e "${YELLOW}等待 WARP 隧道建立...${PLAIN}"
-        sleep 3
-
-        if warp-cli --accept-tos status | grep -i "Connected" > /dev/null 2>&1; then
-            echo -e "${GREEN}✔ WARP 代理已成功稳定运行在 127.0.0.1:40000${PLAIN}"
-        else
-            echo -e "${RED}✘ WARP 连接未生效，请检查服务器网络或尝试重启机器。${PLAIN}"
-            warp-cli --accept-tos status
-            pause; return
+    # 2. 确保 warp-svc 守护进程就绪（否则后续 warp-cli 命令会失败）
+    echo -e "\n${CYAN}启动并等待 warp-svc 就绪...${PLAIN}"
+    systemctl enable --now warp-svc >/dev/null 2>&1
+    local ready=0 st_out
+    for k in $(seq 1 15); do
+        st_out=$(warp-cli --accept-tos status 2>&1)
+        if systemctl is-active --quiet warp-svc 2>/dev/null && [[ -n "$st_out" && "$st_out" != *"Unable to connect"* ]]; then
+            ready=1; break
         fi
-    else
-        echo -e "${RED}✘ WARP 注册请求被拒。${PLAIN}"
+        sleep 1
+    done
+    [[ "$ready" -eq 0 ]] && { _warp_abort "warp-svc 未能就绪，请检查: systemctl status warp-svc"; return; }
+
+    # 3. 端口检查：已是 warp 自身占用则放行，否则按普通端口冲突处理
+    if ss -tlnp 2>/dev/null | grep -P ":${WARP_PORT}(?:\s|$)" | grep -q 'warp'; then
+        :
+    elif ! check_port "$WARP_PORT"; then
         pause; return
     fi
 
-    # 3. 注入 Sing-box 出站配置
+    # 4. 注册：已有注册默认保留（重新注册会丢失已绑定的 WARP+ license）
+    echo -e "\n${CYAN}配置 WARP 本地代理隧道...${PLAIN}"
+    local need_register=1
+    if _warp_registered; then
+        echo -e "${YELLOW}检测到已有 WARP 注册。${PLAIN}"
+        read -p "是否删除并重新注册？(将丢失已绑定的 WARP+ license) [y/N]: " _rereg
+        if [[ "$_rereg" =~ ^[yY]$ ]]; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1
+            warp-cli --accept-tos registration delete >/dev/null 2>&1
+        else
+            need_register=0
+        fi
+    fi
+
+    # 5. 先切代理模式再注册/连接；任何一步失败都不能 connect，
+    #    否则默认的全隧道模式会把整台 VPS 的流量（含 SSH）劫进隧道
+    local mode_ok=0
+    _warp_set_proxy && mode_ok=1
+
+    if [[ "$need_register" -eq 1 ]]; then
+        # 用 yes 兜底，防止个别版本的 registration new 弹出交互确认导致脚本卡死
+        if ! yes | warp-cli --accept-tos registration new; then
+            _warp_abort "WARP 注册请求被拒。"; return
+        fi
+    fi
+
+    if [[ "$mode_ok" -eq 0 ]]; then
+        # 个别版本需要注册后才能设置模式，注册后重试一次
+        if ! _warp_set_proxy; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1
+            _warp_abort "无法切换到代理模式，已中止且未执行 connect（避免 SSH 被劫持）。请手动检查: warp-cli settings"
+            return
+        fi
+    fi
+
+    warp-cli --accept-tos connect >/dev/null 2>&1 || { _warp_abort "warp-cli connect 失败"; return; }
+
+    # 6. 等待连接，并通过代理端口做端到端验证 (trace 中 warp=on / plus)
+    echo -e "${YELLOW}等待 WARP 隧道建立...${PLAIN}"
+    local connected=0 verified=0
+    for k in $(seq 1 15); do
+        if warp-cli --accept-tos status 2>/dev/null | grep -qiE 'Status update:[[:space:]]*Connected'; then
+            connected=1; break
+        fi
+        sleep 2
+    done
+    if [[ "$connected" -eq 1 ]]; then
+        for k in 1 2 3; do
+            if curl -s --max-time 10 --socks5-hostname "127.0.0.1:${WARP_PORT}" \
+                    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)'; then
+                verified=1; break
+            fi
+            sleep 2
+        done
+    fi
+    if [[ "$verified" -eq 1 ]]; then
+        echo -e "${GREEN}✔ WARP 代理已成功运行在 127.0.0.1:${WARP_PORT} (已通过 trace 验证 warp=on)${PLAIN}"
+    else
+        echo -e "${RED}✘ WARP 未能通过验证 (已连接: $([[ $connected -eq 1 ]] && echo 是 || echo 否))，请检查服务器网络或尝试重启机器。${PLAIN}"
+        warp-cli --accept-tos status
+        pause; return
+    fi
+
+    # 7. 注入 Sing-box 出站配置
     echo -e "\n${CYAN}正在将 WARP 节点写入 Sing-box 出站配置...${PLAIN}"
-    make_tmp
-    
     local has_warp
     has_warp=$(jq 'any(.outbounds[]; .tag == "warp-out")' "$CONFIG_FILE")
-    
+
     if [[ "$has_warp" == "true" ]]; then
         echo -e "${YELLOW}检测到配置文件中已存在 Tag 为 [warp-out] 的出站节点，无需重复添加。${PLAIN}"
     else
+        make_tmp
         # 注意: WARP 本地代理模式只支持 TCP CONNECT，不支持 SOCKS5 UDP ASSOCIATE，
-        # 所以这里显式声明 network 为 tcp，避免 UDP 流量（如 QUIC/HTTP3、DNS UDP 查询）
-        # 被分流到 warp-out 后连接失败或长时间挂起
-        jq '.outbounds += [{
+        # 所以显式声明 network 为 tcp，避免 UDP 流量被分流到 warp-out 后连接失败或挂起
+        jq --argjson port "$WARP_PORT" '.outbounds += [{
             "type": "socks",
             "tag": "warp-out",
             "server": "127.0.0.1",
-            "server_port": 40000,
+            "server_port": $port,
             "version": "5",
             "network": "tcp"
         }]' "$CONFIG_FILE" > "$_TMP_JSON"
-        
+
         if save_and_restart; then
             echo -e "${GREEN}✔ WARP 出站节点 (warp-out) 注入成功！${PLAIN}"
             echo -e "-----------------------------------------------"
